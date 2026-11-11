@@ -1,4 +1,4 @@
-//! End-to-end tests: run the real `iosh` binary non-interactively.
+//! End-to-end tests: run the real `shino` binary non-interactively.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
@@ -11,23 +11,23 @@ use std::sync::{Arc, Mutex};
 
 use rustix::process::{Pid, Signal};
 
-const IOSH: &str = env!("CARGO_BIN_EXE_iosh");
+const SHINO: &str = env!("CARGO_BIN_EXE_shino");
 
 /// A fresh scratch directory, used as the shell's working directory.
 fn scratch(name: &str) -> PathBuf {
     let dir: PathBuf =
-        std::env::temp_dir().join(format!("iosh-test-{}-{name}", std::process::id()));
+        std::env::temp_dir().join(format!("shino-test-{}-{name}", std::process::id()));
     let _: std::io::Result<()> = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
 
-/// Runs `iosh -c script` in `dir`; returns (exit code, stdout, stderr).
+/// Runs `shino -c script` in `dir`; returns (exit code, stdout, stderr).
 fn run_c(dir: &PathBuf, script: &str) -> (i32, String, String) {
-    let out: Output = Command::new(IOSH)
+    let out: Output = Command::new(SHINO)
         .args(["-c", script])
         .current_dir(dir)
-        .env_remove("IOSH_HISTFILE")
+        .env_remove("SHINO_HISTFILE")
         .output()
         .unwrap();
     (
@@ -37,16 +37,16 @@ fn run_c(dir: &PathBuf, script: &str) -> (i32, String, String) {
     )
 }
 
-/// Feeds `input` to iosh on stdin; returns (exit code, stdout, stderr).
+/// Feeds `input` to shino on stdin; returns (exit code, stdout, stderr).
 fn run_stdin(dir: &PathBuf, input: &str, histfile: Option<&PathBuf>) -> (i32, String, String) {
-    let mut cmd: Command = Command::new(IOSH);
+    let mut cmd: Command = Command::new(SHINO);
     cmd.current_dir(dir)
-        .env_remove("IOSH_HISTFILE")
+        .env_remove("SHINO_HISTFILE")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(path) = histfile {
-        cmd.env("IOSH_HISTFILE", path);
+        cmd.env("SHINO_HISTFILE", path);
     }
     let mut child: Child = cmd.spawn().unwrap();
     child
@@ -100,7 +100,7 @@ fn redirections() {
     );
     let (code, _, err): (i32, String, String) = run_c(&dir, "cat < missing");
     assert_eq!(code, 1);
-    assert_eq!(err, "iosh: missing: No such file or directory\n");
+    assert_eq!(err, "shino: missing: No such file or directory\n");
 }
 
 #[test]
@@ -149,7 +149,7 @@ fn history_expansion_and_file() {
         "one\necho one\none\necho from-file\nfrom-file\necho from-file | tr a-z A-Z\nFROM-FILE\n\
          \x20   4  echo from-file | tr a-z A-Z\n    5  history 2\n"
     );
-    assert_eq!(err, "iosh: !nope: event not found\n");
+    assert_eq!(err, "shino: !nope: event not found\n");
     // Saved on exit (the failed expansion is not recorded).
     assert_eq!(
         std::fs::read_to_string(&histfile).unwrap(),
@@ -166,12 +166,12 @@ fn exit_codes_and_errors() {
     let (code, _, err): (i32, String, String) = run_c(&dir, "no-such-command-x");
     assert_eq!(
         (code, err.as_str()),
-        (127, "iosh: no-such-command-x: command not found\n")
+        (127, "shino: no-such-command-x: command not found\n")
     );
     let (code, _, err): (i32, String, String) = run_c(&dir, "echo a |");
     assert_eq!(
         (code, err.as_str()),
-        (2, "iosh: syntax error: unexpected end of line\n")
+        (2, "shino: syntax error: unexpected end of line\n")
     );
     let (code, out, err): (i32, String, String) = run_c(&dir, "sh -c 'kill -ABRT $$'; echo st=$?");
     assert_eq!(code, 0);
@@ -181,11 +181,11 @@ fn exit_codes_and_errors() {
     assert_eq!(run_stdin(&dir, "echo x\nfalse\n", None).0, 1);
 }
 
-/// Spawns iosh in its own process group (like a terminal's foreground job)
+/// Spawns shino in its own process group (like a terminal's foreground job)
 /// running `input`, and waits until it has printed "ready".
 fn spawn_ready(input: &str) -> (Child, Instant) {
-    let mut child: Child = Command::new(IOSH)
-        .env_remove("IOSH_HISTFILE")
+    let mut child: Child = Command::new(SHINO)
+        .env_remove("SHINO_HISTFILE")
         .process_group(0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -241,7 +241,7 @@ fn sigterm_is_forwarded_and_exits() {
     assert!(start.elapsed() < Duration::from_secs(3));
 }
 
-/// iosh on a pseudo-terminal, driven like a user at the keyboard. (Not its
+/// shino on a pseudo-terminal, driven like a user at the keyboard. (Not its
 /// controlling terminal, so keys don't raise signals here.)
 struct Terminal {
     master: OwnedFd,
@@ -263,10 +263,10 @@ impl Terminal {
             Mode::empty(),
         )
         .unwrap();
-        let child: Child = Command::new(IOSH)
+        let child: Child = Command::new(SHINO)
             .current_dir(dir)
             .env("HOME", dir)
-            .env("IOSH_HISTFILE", histfile)
+            .env("SHINO_HISTFILE", histfile)
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave))
@@ -330,7 +330,7 @@ fn line_editor_history_and_keys() {
     let histfile: PathBuf = dir.join("hist");
     std::fs::write(&histfile, "echo first\necho second\n").unwrap();
     let mut term: Terminal = Terminal::spawn(&dir, &histfile);
-    term.wait_for("iosh:~$ ");
+    term.wait_for("shino:~$ ");
 
     // Up twice: the older entry. (Command output gets \r\n from the tty.)
     term.send(b"\x1b[A\x1b[A\r");

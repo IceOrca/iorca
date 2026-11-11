@@ -11,7 +11,7 @@ use std::os::unix::net as unix;
 use std::path::Path;
 use std::rc::Rc;
 
-use crate::io::{self as shared, WriteMode};
+use crate::stdio::{self as shared, WriteMode};
 use crate::{Domain, EventLoop, OpId, SockAddr, Type};
 
 /// Defines a socket handle type wrapping `Rc<$std>`, with `close`, `as_std`

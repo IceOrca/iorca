@@ -11,7 +11,7 @@ const NAMES: [&str; 8] = [
 ];
 
 const HELP: &str = "\
-iosh: a small shell on the iorca io_uring event loop
+shino: a small shell on the iorca io_uring event loop
 
 builtins:
   cd [dir|-]          change directory (default $HOME)
@@ -66,7 +66,7 @@ impl Outcome {
 
     fn fail(status: i32, msg: String) -> Self {
         Self {
-            err: format!("iosh: {msg}\n").into_bytes(),
+            err: format!("shino: {msg}\n").into_bytes(),
             status,
             ..Self::default()
         }

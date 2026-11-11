@@ -6,7 +6,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use crate::io::{self as shared, WriteMode};
+use crate::stdio::{self as shared, WriteMode};
 use crate::{EventLoop, Metadata, OpId, OpenOptions};
 
 /// An open file. Reads and writes are positional (`read_at` / `write_at`).

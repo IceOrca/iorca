@@ -14,7 +14,7 @@
 //! * Buffers are passed **by value** (`Vec<u8>`) and handed back in the
 //!   callback. The loop owns the buffer while the kernel may access it, which
 //!   is what makes completion-based I/O memory safe (same idea as
-//!   `tokio-uring`'s buffer ownership model).
+//!   `tokio-rs/tokio-uring`'s buffer ownership model).
 //! * Typed handles keep their fd open while operations are in flight (see
 //!   below). With the raw ops you pass a [`RawFd`](std::os::fd::RawFd) and
 //!   must keep it open until the operation completes yourself.
@@ -68,14 +68,14 @@
 
 mod event_loop;
 mod filesystem;
-mod io;
 mod network;
 mod ops;
+mod stdio;
 mod timer;
 
 pub use event_loop::{EventLoop, OpId};
 pub use filesystem::{File, metadata};
-pub use io::{Stderr, Stdin, Stdout, stderr, stdin, stdout};
 pub use iorca_driver::{Domain, Metadata, OpenOptions, Protocol, SockAddr, Type};
 pub use network::{TcpListener, TcpStream, UdpSocket, UnixDatagram, UnixListener, UnixStream};
+pub use stdio::{Stderr, Stdin, Stdout, stderr, stdin, stdout};
 pub use timer::Timer;

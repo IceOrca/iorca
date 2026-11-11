@@ -1,12 +1,12 @@
 [package]
-name = "iosh"
+name = "shino"
 version.workspace = true
 edition.workspace = true
 description = "A small interactive shell built on the iorca event loop"
 publish = false
 
 [[bin]]
-name = "iosh"
+name = "shino"
 path = "src/main.rs"
 
 [dependencies]

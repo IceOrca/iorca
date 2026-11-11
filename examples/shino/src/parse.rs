@@ -1,4 +1,4 @@
-//! Lexer, parser and word expansion for iosh's command language.
+//! Lexer, parser and word expansion for shino's command language.
 //!
 //! ```text
 //! list     := pipeline ((';' | '&&' | '||') pipeline)* [';']

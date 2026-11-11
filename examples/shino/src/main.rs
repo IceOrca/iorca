@@ -1,14 +1,14 @@
-//! iosh: a small interactive shell whose I/O runs on the iorca event loop.
+//! shino: a small interactive shell whose I/O runs on the iorca event loop.
 //!
 //! ```text
-//! iosh                 interactive (prompt, history file, Ctrl+C handling)
-//! iosh -c 'commands'   run commands, then exit with the last status
-//! cmds | iosh          run commands from stdin
+//! shino                 interactive (prompt, history file, Ctrl+C handling)
+//! shino -c 'commands'   run commands, then exit with the last status
+//! cmds | shino          run commands from stdin
 //! ```
 //!
 //! On a terminal, the prompt has line editing: ↑/↓ browse history, ←/→,
 //! Home/End and the usual Ctrl keys edit. History is kept in
-//! `$IOSH_HISTFILE`, or `~/.iosh_history` when interactive. Type `help` for
+//! `$SHINO_HISTFILE`, or `~/.shino_history` when interactive. Type `help` for
 //! the syntax.
 
 mod builtins;
@@ -31,14 +31,14 @@ fn main() {
         [] => None,
         [flag, command] if flag == "-c" => Some(command.clone()),
         _ => {
-            eprintln!("usage: iosh [-c COMMAND]");
+            eprintln!("usage: shino [-c COMMAND]");
             std::process::exit(2);
         }
     };
     match run(script) {
         Ok(code) => std::process::exit(code),
         Err(e) => {
-            eprintln!("iosh: {e}");
+            eprintln!("shino: {e}");
             std::process::exit(1);
         }
     }
@@ -46,11 +46,11 @@ fn main() {
 
 fn run(script: Option<String>) -> io::Result<i32> {
     let interactive: bool = script.is_none() && io::stdin().is_terminal();
-    let hist_path: Option<PathBuf> = std::env::var_os("IOSH_HISTFILE")
+    let hist_path: Option<PathBuf> = std::env::var_os("SHINO_HISTFILE")
         .map(PathBuf::from)
         .or_else(|| -> Option<PathBuf> {
             let home: PathBuf = PathBuf::from(std::env::var_os("HOME")?);
-            interactive.then(|| -> PathBuf { home.join(".iosh_history") })
+            interactive.then(|| -> PathBuf { home.join(".shino_history") })
         });
     let mut el: EventLoop = EventLoop::new()?;
     let sh: Sh = shell::Shell::new(interactive, script, hist_path);

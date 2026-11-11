@@ -1,5 +1,5 @@
 [workspace]
-members = ["iorca-driver", "examples/iosh"]
+members = ["iorca-driver", "examples/shino"]
 
 [workspace.package]
 version = "0.1.0"

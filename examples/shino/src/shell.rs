@@ -202,13 +202,13 @@ pub fn after_output(el: &mut EventLoop, sh: &Sh, then: Done) {
     }
 }
 
-/// Prints `iosh: msg` on stderr.
+/// Prints `shino: msg` on stderr.
 pub fn error(el: &mut EventLoop, sh: &Sh, msg: &str) {
     print(
         el,
         sh,
         Out::Stderr,
-        format!("iosh: {msg}\n").into_bytes(),
+        format!("shino: {msg}\n").into_bytes(),
         None,
     );
 }
@@ -477,8 +477,8 @@ fn prompt_text(s: &Shell) -> String {
         _ => cwd,
     };
     match s.status {
-        0 => format!("iosh:{cwd}$ "),
-        code => format!("iosh:{cwd} [{code}]$ "),
+        0 => format!("shino:{cwd}$ "),
+        code => format!("shino:{cwd} [{code}]$ "),
     }
 }
 
