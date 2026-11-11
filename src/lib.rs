@@ -40,11 +40,11 @@
 //! use iorca::EventLoop;
 //! use std::time::Duration;
 //!
-//! let mut el = EventLoop::new().unwrap();
-//! el.timeout(Duration::from_millis(10), |el, res| {
+//! let mut el: EventLoop = EventLoop::new().unwrap();
+//! el.timeout(Duration::from_millis(10), |el: &mut EventLoop, res: std::io::Result<()>| {
 //!     res.unwrap();
 //!     println!("timer fired");
-//!     el.nop(|_, _| println!("nop completed"));
+//!     el.nop(|_: &mut EventLoop, _: std::io::Result<()>| println!("nop completed"));
 //! });
 //! el.run().unwrap();
 //! ```

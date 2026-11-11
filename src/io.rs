@@ -6,7 +6,7 @@
 //! handle in the meantime.
 
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::rc::Rc;
 
 use crate::{EventLoop, OpId};
@@ -42,23 +42,27 @@ where
 {
     if buf.is_empty() {
         // Still complete asynchronously, never inside the caller.
-        el.nop(move |el, _| cb(el, Ok(()), buf));
+        el.nop(move |el: &mut EventLoop, _: io::Result<()>| cb(el, Ok(()), buf));
         return;
     }
-    let raw = fd.as_raw_fd();
-    let next = move |el: &mut EventLoop, res: io::Result<usize>, mut buf: Vec<u8>| match res {
-        Ok(0) => cb(el, Err(io::ErrorKind::WriteZero.into()), buf),
-        Ok(n) => {
-            buf.drain(..n);
-            if buf.is_empty() {
-                cb(el, Ok(()), buf)
-            } else {
-                write_all(el, fd, mode.advance(n), buf, cb)
+    let raw: RawFd = fd.as_raw_fd();
+    // Boxed so the continuation has a nameable type.
+    type Next = Box<dyn FnOnce(&mut EventLoop, io::Result<usize>, Vec<u8>)>;
+    let next: Next = Box::new(
+        move |el: &mut EventLoop, res: io::Result<usize>, mut buf: Vec<u8>| match res {
+            Ok(0) => cb(el, Err(io::Error::from(io::ErrorKind::WriteZero)), buf),
+            Ok(n) => {
+                buf.drain(..n);
+                if buf.is_empty() {
+                    cb(el, Ok(()), buf)
+                } else {
+                    write_all(el, fd, mode.advance(n), buf, cb)
+                }
             }
-        }
-        Err(e) if e.kind() == io::ErrorKind::Interrupted => write_all(el, fd, mode, buf, cb),
-        Err(e) => cb(el, Err(e), buf),
-    };
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => write_all(el, fd, mode, buf, cb),
+            Err(e) => cb(el, Err(e), buf),
+        },
+    );
     match mode {
         WriteMode::At(offset) => el.write(raw, buf, offset, next),
         WriteMode::Current => el.write(raw, buf, u64::MAX, next),
@@ -72,11 +76,15 @@ where
     T: AsRawFd + 'static,
     F: FnOnce(&mut EventLoop, io::Result<usize>, Vec<u8>) + 'static,
 {
-    let keep = Rc::clone(fd);
-    el.recv(fd.as_raw_fd(), buf, move |el, res, buf| {
-        drop(keep);
-        cb(el, res, buf)
-    })
+    let keep: Rc<T> = Rc::clone(fd);
+    el.recv(
+        fd.as_raw_fd(),
+        buf,
+        move |el: &mut EventLoop, res: io::Result<usize>, buf: Vec<u8>| {
+            drop(keep);
+            cb(el, res, buf)
+        },
+    )
 }
 
 /// `send` on `fd`, keeping it alive until completion.
@@ -85,11 +93,15 @@ where
     T: AsRawFd + 'static,
     F: FnOnce(&mut EventLoop, io::Result<usize>, Vec<u8>) + 'static,
 {
-    let keep = Rc::clone(fd);
-    el.send(fd.as_raw_fd(), buf, move |el, res, buf| {
-        drop(keep);
-        cb(el, res, buf)
-    })
+    let keep: Rc<T> = Rc::clone(fd);
+    el.send(
+        fd.as_raw_fd(),
+        buf,
+        move |el: &mut EventLoop, res: io::Result<usize>, buf: Vec<u8>| {
+            drop(keep);
+            cb(el, res, buf)
+        },
+    )
 }
 
 /// `read` on `fd` at `offset`, keeping it alive until completion.
@@ -98,11 +110,16 @@ where
     T: AsRawFd + 'static,
     F: FnOnce(&mut EventLoop, io::Result<usize>, Vec<u8>) + 'static,
 {
-    let keep = Rc::clone(fd);
-    el.read(fd.as_raw_fd(), buf, offset, move |el, res, buf| {
-        drop(keep);
-        cb(el, res, buf)
-    })
+    let keep: Rc<T> = Rc::clone(fd);
+    el.read(
+        fd.as_raw_fd(),
+        buf,
+        offset,
+        move |el: &mut EventLoop, res: io::Result<usize>, buf: Vec<u8>| {
+            drop(keep);
+            cb(el, res, buf)
+        },
+    )
 }
 
 /// `write` on `fd` at `offset`, keeping it alive until completion.
@@ -111,11 +128,16 @@ where
     T: AsRawFd + 'static,
     F: FnOnce(&mut EventLoop, io::Result<usize>, Vec<u8>) + 'static,
 {
-    let keep = Rc::clone(fd);
-    el.write(fd.as_raw_fd(), buf, offset, move |el, res, buf| {
-        drop(keep);
-        cb(el, res, buf)
-    })
+    let keep: Rc<T> = Rc::clone(fd);
+    el.write(
+        fd.as_raw_fd(),
+        buf,
+        offset,
+        move |el: &mut EventLoop, res: io::Result<usize>, buf: Vec<u8>| {
+            drop(keep);
+            cb(el, res, buf)
+        },
+    )
 }
 
 /// Closes the handle's fd asynchronously if this is the last reference.
@@ -125,14 +147,15 @@ where
 /// gets `Ok(())`.
 pub(crate) fn close<T, F>(el: &mut EventLoop, fd: Rc<T>, cb: F) -> OpId
 where
-    T: Into<OwnedFd> + 'static,
+    T: 'static,
+    OwnedFd: From<T>,
     F: FnOnce(&mut EventLoop, io::Result<()>) + 'static,
 {
     match Rc::try_unwrap(fd) {
-        Ok(inner) => el.close(inner.into(), cb),
+        Ok(inner) => el.close(OwnedFd::from(inner), cb),
         Err(shared) => {
             drop(shared);
-            el.nop(move |el, _| cb(el, Ok(())))
+            el.nop(move |el: &mut EventLoop, _: io::Result<()>| cb(el, Ok(())))
         }
     }
 }
@@ -144,7 +167,7 @@ where
     T: 'static,
     F: FnOnce(&mut EventLoop, io::Result<T>) + 'static,
 {
-    el.nop(move |el, _| cb(el, Err(err)))
+    el.nop(move |el: &mut EventLoop, _: io::Result<()>| cb(el, Err(err)))
 }
 
 /// Handle to the process's standard input. Created by [`stdin`].

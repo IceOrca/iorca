@@ -150,7 +150,9 @@ impl TcpStream {
     where
         F: FnOnce(&mut EventLoop, io::Result<TcpStream>) + 'static,
     {
-        el.tcp_connect(addr, move |el, res| cb(el, res.map(TcpStream::from)))
+        el.tcp_connect(addr, move |el: &mut EventLoop, res: io::Result<OwnedFd>| {
+            cb(el, res.map(TcpStream::from))
+        })
     }
 }
 
@@ -179,7 +181,7 @@ impl UdpSocket {
     where
         F: FnOnce(&mut EventLoop, io::Result<()>) + 'static,
     {
-        connect(el, &self.inner, addr.into(), cb)
+        connect(el, &self.inner, SockAddr::from(addr), cb)
     }
 
     /// Sends one datagram, `buf[..buf.len()]`, to `addr`.
@@ -187,7 +189,7 @@ impl UdpSocket {
     where
         F: FnOnce(&mut EventLoop, io::Result<usize>, Vec<u8>) + 'static,
     {
-        send_to(el, &self.inner, buf, addr.into(), cb)
+        send_to(el, &self.inner, buf, SockAddr::from(addr), cb)
     }
 
     /// Receives one datagram into `buf` (up to `buf.capacity()` bytes; the
@@ -197,14 +199,26 @@ impl UdpSocket {
     where
         F: FnOnce(&mut EventLoop, io::Result<(usize, SocketAddr)>, Vec<u8>) + 'static,
     {
-        recv_from(el, &self.inner, buf, move |el, res, buf| {
-            let res = res.and_then(|(n, from)| {
-                from.as_socket().map(|addr| (n, addr)).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "sender is not an IP address")
-                })
-            });
-            cb(el, res, buf)
-        })
+        recv_from(
+            el,
+            &self.inner,
+            buf,
+            move |el: &mut EventLoop, res: io::Result<(usize, SockAddr)>, buf: Vec<u8>| {
+                let res: io::Result<(usize, SocketAddr)> = res.and_then(
+                    |(n, from): (usize, SockAddr)| -> io::Result<(usize, SocketAddr)> {
+                        let addr: Option<SocketAddr> = from.as_socket();
+                        addr.map(|addr: SocketAddr| -> (usize, SocketAddr) { (n, addr) })
+                            .ok_or_else(|| -> io::Error {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "sender is not an IP address",
+                                )
+                            })
+                    },
+                );
+                cb(el, res, buf)
+            },
+        )
     }
 }
 
@@ -253,24 +267,33 @@ impl UnixStream {
     where
         F: FnOnce(&mut EventLoop, io::Result<UnixStream>) + 'static,
     {
-        let addr = match SockAddr::unix(path) {
+        let addr: SockAddr = match SockAddr::unix(path) {
             Ok(addr) => addr,
             Err(e) => return shared::fail(el, e, cb),
         };
-        el.socket(Domain::UNIX, Type::STREAM, None, move |el, res| match res {
-            Ok(fd) => {
-                el.connect(fd.as_raw_fd(), addr, move |el, res| {
-                    cb(el, res.map(|()| UnixStream::from(fd)))
-                });
-            }
-            Err(e) => cb(el, Err(e)),
-        })
+        el.socket(
+            Domain::UNIX,
+            Type::STREAM,
+            None,
+            move |el: &mut EventLoop, res: io::Result<OwnedFd>| match res {
+                Ok(fd) => {
+                    el.connect(
+                        fd.as_raw_fd(),
+                        addr,
+                        move |el: &mut EventLoop, res: io::Result<()>| {
+                            cb(el, res.map(|(): ()| -> UnixStream { UnixStream::from(fd) }))
+                        },
+                    );
+                }
+                Err(e) => cb(el, Err(e)),
+            },
+        )
     }
 
     /// Creates a connected pair of sockets (synchronously).
     pub fn pair() -> io::Result<(Self, Self)> {
-        let (a, b) = unix::UnixStream::pair()?;
-        Ok((a.into(), b.into()))
+        let (a, b): (unix::UnixStream, unix::UnixStream) = unix::UnixStream::pair()?;
+        Ok((Self::from(a), Self::from(b)))
     }
 }
 
@@ -288,8 +311,8 @@ impl UnixDatagram {
 
     /// Creates a connected pair of sockets (synchronously).
     pub fn pair() -> io::Result<(Self, Self)> {
-        let (a, b) = unix::UnixDatagram::pair()?;
-        Ok((a.into(), b.into()))
+        let (a, b): (unix::UnixDatagram, unix::UnixDatagram) = unix::UnixDatagram::pair()?;
+        Ok((Self::from(a), Self::from(b)))
     }
 
     /// Sets the default peer to the socket file `path`, so
@@ -317,7 +340,7 @@ impl UnixDatagram {
     {
         match SockAddr::unix(path) {
             Ok(addr) => send_to(el, &self.inner, buf, addr, cb),
-            Err(e) => el.nop(move |el, _| cb(el, Err(e), buf)),
+            Err(e) => el.nop(move |el: &mut EventLoop, _: io::Result<()>| cb(el, Err(e), buf)),
         }
     }
 
@@ -340,11 +363,14 @@ where
     S: From<OwnedFd>,
     F: FnOnce(&mut EventLoop, io::Result<S>) + 'static,
 {
-    let keep = Rc::clone(listener);
-    el.accept(listener.as_raw_fd(), move |el, res| {
-        drop(keep);
-        cb(el, res.map(S::from))
-    })
+    let keep: Rc<T> = Rc::clone(listener);
+    el.accept(
+        listener.as_raw_fd(),
+        move |el: &mut EventLoop, res: io::Result<OwnedFd>| {
+            drop(keep);
+            cb(el, res.map(S::from))
+        },
+    )
 }
 
 fn connect<T, F>(el: &mut EventLoop, socket: &Rc<T>, addr: SockAddr, cb: F) -> OpId
@@ -352,11 +378,15 @@ where
     T: AsRawFd + 'static,
     F: FnOnce(&mut EventLoop, io::Result<()>) + 'static,
 {
-    let keep = Rc::clone(socket);
-    el.connect(socket.as_raw_fd(), addr, move |el, res| {
-        drop(keep);
-        cb(el, res)
-    })
+    let keep: Rc<T> = Rc::clone(socket);
+    el.connect(
+        socket.as_raw_fd(),
+        addr,
+        move |el: &mut EventLoop, res: io::Result<()>| {
+            drop(keep);
+            cb(el, res)
+        },
+    )
 }
 
 fn send_to<T, F>(el: &mut EventLoop, socket: &Rc<T>, buf: Vec<u8>, addr: SockAddr, cb: F) -> OpId
@@ -364,11 +394,16 @@ where
     T: AsRawFd + 'static,
     F: FnOnce(&mut EventLoop, io::Result<usize>, Vec<u8>) + 'static,
 {
-    let keep = Rc::clone(socket);
-    el.send_to(socket.as_raw_fd(), buf, addr, move |el, res, buf| {
-        drop(keep);
-        cb(el, res, buf)
-    })
+    let keep: Rc<T> = Rc::clone(socket);
+    el.send_to(
+        socket.as_raw_fd(),
+        buf,
+        addr,
+        move |el: &mut EventLoop, res: io::Result<usize>, buf: Vec<u8>| {
+            drop(keep);
+            cb(el, res, buf)
+        },
+    )
 }
 
 fn recv_from<T, F>(el: &mut EventLoop, socket: &Rc<T>, buf: Vec<u8>, cb: F) -> OpId
@@ -376,9 +411,13 @@ where
     T: AsRawFd + 'static,
     F: FnOnce(&mut EventLoop, io::Result<(usize, SockAddr)>, Vec<u8>) + 'static,
 {
-    let keep = Rc::clone(socket);
-    el.recv_from(socket.as_raw_fd(), buf, move |el, res, buf| {
-        drop(keep);
-        cb(el, res, buf)
-    })
+    let keep: Rc<T> = Rc::clone(socket);
+    el.recv_from(
+        socket.as_raw_fd(),
+        buf,
+        move |el: &mut EventLoop, res: io::Result<(usize, SockAddr)>, buf: Vec<u8>| {
+            drop(keep);
+            cb(el, res, buf)
+        },
+    )
 }

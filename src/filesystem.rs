@@ -33,7 +33,7 @@ impl File {
     where
         F: FnOnce(&mut EventLoop, io::Result<File>) + 'static,
     {
-        let mut options = OpenOptions::new();
+        let mut options: OpenOptions = OpenOptions::new();
         options.write(true).create(true).truncate(true);
         Self::open_with(el, path, &options, cb)
     }
@@ -48,7 +48,11 @@ impl File {
     where
         F: FnOnce(&mut EventLoop, io::Result<File>) + 'static,
     {
-        el.open(path, options, move |el, res| cb(el, res.map(File::from)))
+        el.open(
+            path,
+            options,
+            move |el: &mut EventLoop, res: io::Result<OwnedFd>| cb(el, res.map(File::from)),
+        )
     }
 
     /// Reads up to `buf.capacity()` bytes at `offset` into the start of `buf`.
@@ -82,11 +86,14 @@ impl File {
     where
         F: FnOnce(&mut EventLoop, io::Result<()>) + 'static,
     {
-        let keep = Rc::clone(&self.inner);
-        el.fsync(self.as_raw_fd(), move |el, res| {
-            drop(keep);
-            cb(el, res)
-        })
+        let keep: Rc<fs::File> = Rc::clone(&self.inner);
+        el.fsync(
+            self.as_raw_fd(),
+            move |el: &mut EventLoop, res: io::Result<()>| {
+                drop(keep);
+                cb(el, res)
+            },
+        )
     }
 
     /// Flushes data to disk, skipping metadata not needed to read it back
@@ -95,11 +102,14 @@ impl File {
     where
         F: FnOnce(&mut EventLoop, io::Result<()>) + 'static,
     {
-        let keep = Rc::clone(&self.inner);
-        el.fdatasync(self.as_raw_fd(), move |el, res| {
-            drop(keep);
-            cb(el, res)
-        })
+        let keep: Rc<fs::File> = Rc::clone(&self.inner);
+        el.fdatasync(
+            self.as_raw_fd(),
+            move |el: &mut EventLoop, res: io::Result<()>| {
+                drop(keep);
+                cb(el, res)
+            },
+        )
     }
 
     /// Gets this file's metadata.
@@ -107,11 +117,14 @@ impl File {
     where
         F: FnOnce(&mut EventLoop, io::Result<Metadata>) + 'static,
     {
-        let keep = Rc::clone(&self.inner);
-        el.statx(self.as_raw_fd(), move |el, res| {
-            drop(keep);
-            cb(el, res)
-        })
+        let keep: Rc<fs::File> = Rc::clone(&self.inner);
+        el.statx(
+            self.as_raw_fd(),
+            move |el: &mut EventLoop, res: io::Result<Metadata>| {
+                drop(keep);
+                cb(el, res)
+            },
+        )
     }
 
     /// Closes the file asynchronously. If clones or in-flight operations still

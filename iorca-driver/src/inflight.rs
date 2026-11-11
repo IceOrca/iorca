@@ -5,17 +5,20 @@
 //! contents, a `CString`, or a `Box` allocated *before* the pointer is taken)
 //! owned by the `InFlight` returned alongside it. Moving the `InFlight` (into
 //! the ring's map) does not move that memory.
+//!
+//! C structs passed to the kernel come from [`crate::abi`], so nothing here
+//! needs `unsafe` except [`adopt_fd`].
 
 use std::ffi::CString;
 use std::io;
-use std::mem;
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 
 use io_uring::{opcode, squeue, types};
-use socket2::{SockAddr, SockAddrStorage};
+use socket2::SockAddr;
 
+use crate::abi::{AddrBuf, MsgHdr, StatxBuf};
 use crate::fs::Metadata;
 use crate::op::{Op, Output};
 
@@ -39,27 +42,27 @@ pub(crate) enum InFlight {
     Connect(Box<SockAddr>),
     SendTo {
         buf: Vec<u8>,
-        msg: Box<MsgState>,
+        msg: Box<MsgState<SockAddr>>,
     },
     RecvFrom {
         buf: Vec<u8>,
         orig_len: usize,
-        msg: Box<MsgState>,
+        msg: Box<MsgState<AddrBuf>>,
     },
     Statx {
-        statx: Box<libc::statx>,
+        statx: Box<StatxBuf>,
         path: Option<CString>,
     },
     /// Failed before submission (sent as a `Nop`); this is the final output.
     Ready(Output),
 }
 
-/// A `msghdr` plus the iovec and address it points to, boxed together so the
-/// internal pointers stay valid.
-pub(crate) struct MsgState {
-    hdr: libc::msghdr,
+/// A `msghdr` plus the iovec and address (`A`) it points to, boxed together
+/// so the internal pointers stay valid.
+pub(crate) struct MsgState<A> {
+    hdr: MsgHdr,
     iov: libc::iovec,
-    addr: SockAddrStorage,
+    addr: A,
 }
 
 impl InFlight {
@@ -78,12 +81,14 @@ impl InFlight {
                 }
             }
             InFlight::Fill { mut buf, orig_len } => {
-                let res = cvt(res).map(|n| n as usize);
+                let res: io::Result<usize> = cvt(res).map(|n: u32| -> usize { n as usize });
                 // On error the kernel wrote nothing; restore the original length.
                 buf.truncate(*res.as_ref().unwrap_or(&orig_len));
                 Output::Bytes(res, buf)
             }
-            InFlight::Drain { buf } => Output::Bytes(cvt(res).map(|n| n as usize), buf),
+            InFlight::Drain { buf } => {
+                Output::Bytes(cvt(res).map(|n: u32| -> usize { n as usize }), buf)
+            }
             InFlight::NewFd { path } => {
                 drop(path);
                 Output::Fd(adopt_fd(res))
@@ -94,16 +99,19 @@ impl InFlight {
             }
             InFlight::SendTo { buf, msg } => {
                 drop(msg);
-                Output::Bytes(cvt(res).map(|n| n as usize), buf)
+                Output::Bytes(cvt(res).map(|n: u32| -> usize { n as usize }), buf)
             }
             InFlight::RecvFrom {
                 mut buf,
                 orig_len,
                 msg,
             } => {
-                let MsgState { hdr, addr, .. } = *msg;
-                let res = cvt(res).map(|n| (n as usize, sender_addr(addr, hdr.msg_namelen)));
-                let n = match &res {
+                // The kernel updated `namelen` to the sender address's length.
+                let res: io::Result<(usize, SockAddr)> =
+                    cvt(res).and_then(|n: u32| -> io::Result<(usize, SockAddr)> {
+                        Ok((n as usize, msg.addr.decode(msg.hdr.namelen)?))
+                    });
+                let n: usize = match &res {
                     Ok((n, _)) => *n,
                     Err(_) => orig_len,
                 };
@@ -112,7 +120,9 @@ impl InFlight {
             }
             InFlight::Statx { statx, path } => {
                 drop(path);
-                Output::Metadata(cvt(res).map(|_| Metadata::from_statx(&statx)))
+                Output::Metadata(
+                    cvt(res).map(|_: u32| -> Metadata { Metadata::from_statx(&statx) }),
+                )
             }
             InFlight::Ready(output) => output,
         }
@@ -124,7 +134,7 @@ pub(crate) fn prepare(op: Op) -> (squeue::Entry, InFlight) {
     match op {
         Op::Nop => (opcode::Nop::new().build(), InFlight::Unit),
         Op::Timeout(dur) => {
-            let ts = Box::new(
+            let ts: Box<types::Timespec> = Box::new(
                 types::Timespec::new()
                     .sec(dur.as_secs())
                     .nsec(dur.subsec_nanos()),
@@ -133,16 +143,17 @@ pub(crate) fn prepare(op: Op) -> (squeue::Entry, InFlight) {
         }
         Op::Cancel { target } => (opcode::AsyncCancel::new(target).build(), InFlight::Unit),
         Op::Read { fd, buf, offset } => {
-            let (ptr, len, buf, orig_len) = fill(buf);
-            let entry = opcode::Read::new(types::Fd(fd), ptr, len)
+            let (ptr, len, buf, orig_len): (*mut u8, u32, Vec<u8>, usize) = fill(buf);
+            let entry: squeue::Entry = opcode::Read::new(types::Fd(fd), ptr, len)
                 .offset(offset)
                 .build();
             (entry, InFlight::Fill { buf, orig_len })
         }
         Op::Write { fd, buf, offset } => {
-            let entry = opcode::Write::new(types::Fd(fd), buf.as_ptr(), io_len(buf.len()))
-                .offset(offset)
-                .build();
+            let entry: squeue::Entry =
+                opcode::Write::new(types::Fd(fd), buf.as_ptr(), io_len(buf.len()))
+                    .offset(offset)
+                    .build();
             (entry, InFlight::Drain { buf })
         }
         Op::Close { fd } => (
@@ -154,22 +165,22 @@ pub(crate) fn prepare(op: Op) -> (squeue::Entry, InFlight) {
             ty,
             protocol,
         } => {
-            let entry = opcode::Socket::new(
-                domain.into(),
+            let entry: squeue::Entry = opcode::Socket::new(
+                libc::c_int::from(domain),
                 libc::c_int::from(ty) | libc::SOCK_CLOEXEC,
-                protocol.map_or(0, Into::into),
+                protocol.map_or(0, libc::c_int::from),
             )
             .build();
             (entry, InFlight::NewFd { path: None })
         }
         Op::Connect { fd, addr } => {
-            let addr = Box::new(addr);
-            let entry =
+            let addr: Box<SockAddr> = Box::new(addr);
+            let entry: squeue::Entry =
                 opcode::Connect::new(types::Fd(fd), addr.as_ptr().cast(), addr.len()).build();
             (entry, InFlight::Connect(addr))
         }
         Op::Accept { listener } => {
-            let entry = opcode::Accept::new(
+            let entry: squeue::Entry = opcode::Accept::new(
                 types::Fd(listener),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
@@ -179,45 +190,63 @@ pub(crate) fn prepare(op: Op) -> (squeue::Entry, InFlight) {
             (entry, InFlight::NewFd { path: None })
         }
         Op::Recv { fd, buf } => {
-            let (ptr, len, buf, orig_len) = fill(buf);
-            let entry = opcode::Recv::new(types::Fd(fd), ptr, len).build();
+            let (ptr, len, buf, orig_len): (*mut u8, u32, Vec<u8>, usize) = fill(buf);
+            let entry: squeue::Entry = opcode::Recv::new(types::Fd(fd), ptr, len).build();
             (entry, InFlight::Fill { buf, orig_len })
         }
         Op::Send { fd, buf } => {
-            let entry = opcode::Send::new(types::Fd(fd), buf.as_ptr(), io_len(buf.len()))
-                .flags(libc::MSG_NOSIGNAL)
-                .build();
+            let entry: squeue::Entry =
+                opcode::Send::new(types::Fd(fd), buf.as_ptr(), io_len(buf.len()))
+                    .flags(libc::MSG_NOSIGNAL)
+                    .build();
             (entry, InFlight::Drain { buf })
         }
         Op::SendTo { fd, mut buf, addr } => {
-            let len = addr.len();
-            let msg = msg_state(buf.as_mut_ptr(), buf.len(), addr.as_storage(), len);
-            let entry = opcode::SendMsg::new(types::Fd(fd), &msg.hdr)
+            // The kernel only reads the address for sendmsg.
+            let msg: Box<MsgState<SockAddr>> = msg_state(
+                buf.as_mut_ptr(),
+                buf.len(),
+                addr,
+                |a: &mut SockAddr| -> (*mut libc::c_void, libc::socklen_t) {
+                    (a.as_ptr().cast_mut().cast(), a.len())
+                },
+            );
+            let entry: squeue::Entry = opcode::SendMsg::new(types::Fd(fd), msg.hdr.as_ptr())
                 .flags(libc::MSG_NOSIGNAL as u32)
                 .build();
             (entry, InFlight::SendTo { buf, msg })
         }
         Op::RecvFrom { fd, buf } => {
-            let (ptr, len, buf, orig_len) = fill(buf);
-            let storage = SockAddrStorage::zeroed();
-            let storage_len = storage.size_of();
-            let mut msg = msg_state(ptr, len as usize, storage, storage_len);
-            let entry = opcode::RecvMsg::new(types::Fd(fd), &mut msg.hdr).build();
+            let (ptr, len, buf, orig_len): (*mut u8, u32, Vec<u8>, usize) = fill(buf);
+            let mut msg: Box<MsgState<AddrBuf>> = msg_state(
+                ptr,
+                len as usize,
+                AddrBuf::zeroed(),
+                |a: &mut AddrBuf| -> (*mut libc::c_void, libc::socklen_t) {
+                    (a.as_mut_ptr(), a.capacity())
+                },
+            );
+            let entry: squeue::Entry =
+                opcode::RecvMsg::new(types::Fd(fd), msg.hdr.as_mut_ptr()).build();
             (entry, InFlight::RecvFrom { buf, orig_len, msg })
         }
         Op::Open { path, options } => {
-            let (flags, path) = match options.flags().and_then(|f| Ok((f, c_path(path)?))) {
+            let opened: io::Result<(i32, CString)> = options
+                .flags()
+                .and_then(|f: i32| -> io::Result<(i32, CString)> { Ok((f, c_path(path)?)) });
+            let (flags, path): (i32, CString) = match opened {
                 Ok(v) => v,
                 Err(e) => return ready(Output::Fd(Err(e))),
             };
-            let entry = opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path.as_ptr())
-                .flags(flags)
-                .mode(options.creation_mode())
-                .build();
+            let entry: squeue::Entry =
+                opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path.as_ptr())
+                    .flags(flags)
+                    .mode(options.creation_mode())
+                    .build();
             (entry, InFlight::NewFd { path: Some(path) })
         }
         Op::Fsync { fd, data_only } => {
-            let flags = if data_only {
+            let flags: types::FsyncFlags = if data_only {
                 types::FsyncFlags::DATASYNC
             } else {
                 types::FsyncFlags::empty()
@@ -235,62 +264,45 @@ pub(crate) fn prepare(op: Op) -> (squeue::Entry, InFlight) {
     }
 }
 
-/// Turns the address `recvmsg` wrote into a `SockAddr`.
-fn sender_addr(addr: SockAddrStorage, len: libc::socklen_t) -> SockAddr {
-    if len == 0 {
-        // Linux reports a datagram from an unbound Unix socket with a
-        // zero-length address. Return the canonical unnamed Unix address
-        // instead, as `std::os::unix::net::UnixDatagram::recv_from` does.
-        return SockAddr::unix("").expect("empty Unix path is always valid");
-    }
-    // SAFETY: on success the kernel wrote a valid socket address of the
-    // socket's family into `addr` and set `len` to its length (≤ the storage
-    // size).
-    unsafe { SockAddr::new(addr, len) }
-}
-
 /// Builds a statx SQE. With `path == None` it stats `dirfd` itself
 /// (`AT_EMPTY_PATH` with an empty path).
 fn statx(dirfd: RawFd, path: Option<CString>, flags: i32) -> (squeue::Entry, InFlight) {
-    // SAFETY: `statx` is a plain C struct of integers; all-zero is valid.
-    let mut statx: Box<libc::statx> = Box::new(unsafe { mem::zeroed() });
-    let path_ptr = path.as_ref().map_or(c"".as_ptr(), |p| p.as_ptr());
-    let entry = opcode::Statx::new(
-        types::Fd(dirfd),
-        path_ptr,
-        (&mut *statx as *mut libc::statx).cast(),
-    )
-    .flags(flags)
-    .mask(libc::STATX_BASIC_STATS)
-    .build();
+    let mut statx: Box<StatxBuf> = StatxBuf::zeroed();
+    let path_ptr: *const libc::c_char = path
+        .as_ref()
+        .map_or(c"".as_ptr(), |p: &CString| -> *const libc::c_char {
+            p.as_ptr()
+        });
+    let entry: squeue::Entry =
+        opcode::Statx::new(types::Fd(dirfd), path_ptr, statx.as_mut_ptr().cast())
+            .flags(flags)
+            .mask(libc::STATX_BASIC_STATS)
+            .build();
     (entry, InFlight::Statx { statx, path })
 }
 
-/// Builds a boxed `msghdr` with one iovec over `buf_ptr[..buf_len]` and the
-/// given address storage.
-fn msg_state(
+/// Builds a boxed `msghdr` with one iovec over `buf_ptr[..buf_len]`. `name`
+/// returns the pointer and length of the address inside the box.
+fn msg_state<A>(
     buf_ptr: *mut u8,
     buf_len: usize,
-    addr: SockAddrStorage,
-    addr_len: libc::socklen_t,
-) -> Box<MsgState> {
-    let mut msg = Box::new(MsgState {
-        // SAFETY: an all-zero `msghdr` is valid (null pointers, zero lengths).
-        // It is zeroed rather than built literally because some libc targets
-        // have private padding fields.
-        hdr: unsafe { mem::zeroed() },
+    addr: A,
+    name: impl FnOnce(&mut A) -> (*mut libc::c_void, libc::socklen_t),
+) -> Box<MsgState<A>> {
+    let mut msg: Box<MsgState<A>> = Box::new(MsgState {
+        hdr: MsgHdr::empty(),
         iov: libc::iovec {
             iov_base: buf_ptr.cast(),
             iov_len: buf_len,
         },
         addr,
     });
-    let addr_ptr: *mut SockAddrStorage = &mut msg.addr;
+    let (name_ptr, name_len): (*mut libc::c_void, libc::socklen_t) = name(&mut msg.addr);
     let iov_ptr: *mut libc::iovec = &mut msg.iov;
-    msg.hdr.msg_name = addr_ptr.cast();
-    msg.hdr.msg_namelen = addr_len;
-    msg.hdr.msg_iov = iov_ptr;
-    msg.hdr.msg_iovlen = 1;
+    msg.hdr.name = name_ptr;
+    msg.hdr.namelen = name_len;
+    msg.hdr.iov = iov_ptr;
+    msg.hdr.iovlen = 1;
     msg
 }
 
@@ -298,7 +310,7 @@ fn msg_state(
 /// memory (no `set_len` needed). Returns the SQE pointer/length, the buffer
 /// and its original length (restored if the operation fails).
 fn fill(mut buf: Vec<u8>) -> (*mut u8, u32, Vec<u8>, usize) {
-    let orig_len = buf.len();
+    let orig_len: usize = buf.len();
     buf.resize(buf.capacity(), 0);
     (buf.as_mut_ptr(), io_len(buf.len()), buf, orig_len)
 }
@@ -310,7 +322,7 @@ fn ready(output: Output) -> (squeue::Entry, InFlight) {
 }
 
 fn c_path(path: PathBuf) -> io::Result<CString> {
-    CString::new(path.into_os_string().into_vec()).map_err(|_| {
+    CString::new(path.into_os_string().into_vec()).map_err(|_: std::ffi::NulError| -> io::Error {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "path contains an interior NUL byte",
@@ -318,9 +330,11 @@ fn c_path(path: PathBuf) -> io::Result<CString> {
     })
 }
 
-/// Takes ownership of a new fd returned by the kernel.
+/// Takes ownership of a new fd returned by the kernel. One of the driver's
+/// two `unsafe` sites: no safe API can turn a raw fd into an `OwnedFd`.
+#[allow(unsafe_code)]
 fn adopt_fd(res: i32) -> io::Result<OwnedFd> {
-    cvt(res).map(|fd| {
+    cvt(res).map(|fd: u32| -> OwnedFd {
         // SAFETY: a successful socket/accept/openat result is a new fd that
         // nothing else owns, so taking ownership of it is sound.
         unsafe { OwnedFd::from_raw_fd(fd as RawFd) }

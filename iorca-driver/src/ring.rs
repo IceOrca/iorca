@@ -39,9 +39,9 @@ impl Ring {
     /// Never fails: an error before submission (e.g. a path containing a NUL
     /// byte) is reported in the operation's [`Completion`].
     pub fn push(&mut self, op: Op) -> u64 {
-        let id = self.next_id;
+        let id: u64 = self.next_id;
         self.next_id += 1;
-        let (entry, resources) = prepare(op);
+        let (entry, resources): (squeue::Entry, InFlight) = prepare(op);
         self.in_flight.insert(id, resources);
         self.backlog.push_back(entry.user_data(id));
         id
@@ -55,7 +55,7 @@ impl Ring {
             return Ok(());
         }
         self.flush_backlog();
-        let want = if self.backlog.is_empty() { 1 } else { 0 };
+        let want: usize = if self.backlog.is_empty() { 1 } else { 0 };
         match self.ring.submit_and_wait(want) {
             Ok(_) => Ok(()),
             // EINTR: interrupted by a signal. EBUSY: the completion queue
@@ -68,7 +68,7 @@ impl Ring {
     /// Appends every available completion to `out` without blocking.
     pub fn reap(&mut self, out: &mut Vec<Completion>) {
         for cqe in self.ring.completion() {
-            let id = cqe.user_data();
+            let id: u64 = cqe.user_data();
             if let Some(resources) = self.in_flight.remove(&id) {
                 out.push(Completion {
                     id,
@@ -81,14 +81,18 @@ impl Ring {
     /// Moves queued entries, in order, into the submission queue until it is
     /// full. This is the only place pointers are handed to the kernel.
     fn flush_backlog(&mut self) {
-        let mut sq = self.ring.submission();
+        let mut sq: squeue::SubmissionQueue<'_> = self.ring.submission();
         while let Some(entry) = self.backlog.front() {
+            // One of the driver's two `unsafe` sites: handing an SQE to the
+            // kernel cannot be checked by the compiler.
+            #[allow(unsafe_code)]
             // SAFETY: every pointer in `entry` was built by `prepare` and refers
             // to heap memory owned by the matching `InFlight` in
             // `self.in_flight`. That entry is removed only in `reap`, after the
             // kernel posted the CQE, and is leaked by `Drop` if the ring dies
             // first. So the memory outlives the kernel's use of it.
-            if unsafe { sq.push(entry) }.is_err() {
+            let pushed: bool = unsafe { sq.push(entry) }.is_ok();
+            if !pushed {
                 break;
             }
             self.backlog.pop_front();
@@ -114,10 +118,10 @@ mod tests {
 
     #[test]
     fn push_submit_reap() {
-        let mut ring = Ring::new(4).unwrap();
-        let id = ring.push(Op::Nop);
+        let mut ring: Ring = Ring::new(4).unwrap();
+        let id: u64 = ring.push(Op::Nop);
         assert_eq!(ring.in_flight(), 1);
-        let mut out = Vec::new();
+        let mut out: Vec<Completion> = Vec::new();
         while out.is_empty() {
             ring.submit_and_wait().unwrap();
             ring.reap(&mut out);
@@ -129,7 +133,7 @@ mod tests {
 
     #[test]
     fn drop_with_pending_op_leaks_safely() {
-        let mut ring = Ring::new(4).unwrap();
+        let mut ring: Ring = Ring::new(4).unwrap();
         ring.push(Op::Timeout(Duration::from_secs(60)));
         // The nop lets `submit_and_wait` return while the timer is in flight.
         ring.push(Op::Nop);

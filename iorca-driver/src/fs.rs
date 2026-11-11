@@ -3,6 +3,8 @@
 use std::io;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::abi::StatxBuf;
+
 /// Options for [`Op::Open`](crate::Op::Open), mirroring
 /// [`std::fs::OpenOptions`]. The file is always opened close-on-exec.
 #[derive(Clone, Debug)]
@@ -86,8 +88,9 @@ impl OpenOptions {
 
     /// The `open(2)` flags, with the same validation rules as `std`.
     pub(crate) fn flags(&self) -> io::Result<i32> {
-        let einval = || Err(io::Error::from_raw_os_error(libc::EINVAL));
-        let access = match (self.read, self.write, self.append) {
+        let einval: fn() -> io::Result<i32> =
+            || -> io::Result<i32> { Err(io::Error::from_raw_os_error(libc::EINVAL)) };
+        let access: i32 = match (self.read, self.write, self.append) {
             (true, false, false) => libc::O_RDONLY,
             (false, true, false) => libc::O_WRONLY,
             (true, true, false) => libc::O_RDWR,
@@ -101,7 +104,7 @@ impl OpenOptions {
             (_, true) if self.truncate && !self.create_new => return einval(),
             _ => {}
         }
-        let creation = match (self.create, self.truncate, self.create_new) {
+        let creation: i32 = match (self.create, self.truncate, self.create_new) {
             (false, false, false) => 0,
             (true, false, false) => libc::O_CREAT,
             (false, true, false) => libc::O_TRUNC,
@@ -129,19 +132,19 @@ pub struct Metadata {
 }
 
 impl Metadata {
-    pub(crate) fn from_statx(st: &libc::statx) -> Self {
+    pub(crate) fn from_statx(st: &StatxBuf) -> Self {
         Self {
-            len: st.stx_size,
-            mode: u32::from(st.stx_mode),
-            uid: st.stx_uid,
-            gid: st.stx_gid,
-            nlink: st.stx_nlink,
-            ino: st.stx_ino,
-            blksize: st.stx_blksize,
-            blocks: st.stx_blocks,
-            accessed: to_system_time(&st.stx_atime),
-            modified: to_system_time(&st.stx_mtime),
-            changed: to_system_time(&st.stx_ctime),
+            len: st.size(),
+            mode: u32::from(st.mode()),
+            uid: st.uid(),
+            gid: st.gid(),
+            nlink: st.nlink(),
+            ino: st.ino(),
+            blksize: st.blksize(),
+            blocks: st.blocks(),
+            accessed: to_system_time(st.atime_sec(), st.atime_nsec()),
+            modified: to_system_time(st.mtime_sec(), st.mtime_nsec()),
+            changed: to_system_time(st.ctime_sec(), st.ctime_nsec()),
         }
     }
 
@@ -215,12 +218,12 @@ impl Metadata {
     }
 }
 
-fn to_system_time(ts: &libc::statx_timestamp) -> SystemTime {
-    let nanos = Duration::from_nanos(u64::from(ts.tv_nsec));
-    if ts.tv_sec >= 0 {
-        UNIX_EPOCH + Duration::from_secs(ts.tv_sec as u64) + nanos
+fn to_system_time(sec: i64, nsec: u32) -> SystemTime {
+    let nanos: Duration = Duration::from_nanos(u64::from(nsec));
+    if sec >= 0 {
+        UNIX_EPOCH + Duration::from_secs(sec as u64) + nanos
     } else {
-        UNIX_EPOCH - Duration::from_secs(ts.tv_sec.unsigned_abs()) + nanos
+        UNIX_EPOCH - Duration::from_secs(sec.unsigned_abs()) + nanos
     }
 }
 
@@ -232,7 +235,7 @@ mod tests {
     fn open_flags_follow_std_rules() {
         assert!(OpenOptions::new().flags().is_err());
         assert!(OpenOptions::new().read(true).create(true).flags().is_err());
-        let f = OpenOptions::new()
+        let f: i32 = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
@@ -242,7 +245,7 @@ mod tests {
         assert_ne!(f & libc::O_CREAT, 0);
         assert_ne!(f & libc::O_TRUNC, 0);
         assert_ne!(f & libc::O_CLOEXEC, 0);
-        let f = OpenOptions::new()
+        let f: i32 = OpenOptions::new()
             .append(true)
             .create_new(true)
             .flags()

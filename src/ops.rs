@@ -97,7 +97,7 @@ impl EventLoop {
         self.push(
             Op::Connect {
                 fd,
-                addr: addr.into(),
+                addr: Into::<SockAddr>::into(addr),
             },
             unit_cb(cb),
         )
@@ -115,11 +115,15 @@ impl EventLoop {
             Domain::for_address(addr),
             Type::STREAM,
             None,
-            move |el, res| match res {
+            move |el: &mut EventLoop, res: io::Result<OwnedFd>| match res {
                 Ok(socket) => {
-                    el.connect(socket.as_raw_fd(), addr, move |el, res| {
-                        cb(el, res.map(|()| socket))
-                    });
+                    el.connect(
+                        socket.as_raw_fd(),
+                        addr,
+                        move |el: &mut EventLoop, res: io::Result<()>| {
+                            cb(el, res.map(|(): ()| -> OwnedFd { socket }))
+                        },
+                    );
                 }
                 Err(e) => cb(el, Err(e)),
             },
@@ -157,7 +161,7 @@ impl EventLoop {
             Op::SendTo {
                 fd,
                 buf,
-                addr: addr.into(),
+                addr: Into::<SockAddr>::into(addr),
             },
             bytes_cb(cb),
         )
@@ -173,7 +177,7 @@ impl EventLoop {
     {
         self.push(
             Op::RecvFrom { fd, buf },
-            Box::new(move |el, out| match out {
+            Box::new(move |el: &mut EventLoop, out: Output| match out {
                 Output::Datagram(res, buf) => cb(el, res, buf),
                 other => mismatch(other),
             }),
@@ -187,7 +191,7 @@ impl EventLoop {
     {
         self.push(
             Op::Open {
-                path: path.into(),
+                path: Into::<PathBuf>::into(path),
                 options: options.clone(),
             },
             fd_cb(cb),
@@ -236,7 +240,12 @@ impl EventLoop {
     where
         F: FnOnce(&mut EventLoop, io::Result<Metadata>) + 'static,
     {
-        self.push(Op::StatxPath { path: path.into() }, metadata_cb(cb))
+        self.push(
+            Op::StatxPath {
+                path: Into::<PathBuf>::into(path),
+            },
+            metadata_cb(cb),
+        )
     }
 
     /// Closes `fd` asynchronously.
@@ -264,7 +273,7 @@ fn unit_cb<F>(cb: F) -> Callback
 where
     F: FnOnce(&mut EventLoop, io::Result<()>) + 'static,
 {
-    Box::new(move |el, out| match out {
+    Box::new(move |el: &mut EventLoop, out: Output| match out {
         Output::Unit(res) => cb(el, res),
         other => mismatch(other),
     })
@@ -274,7 +283,7 @@ fn bytes_cb<F>(cb: F) -> Callback
 where
     F: FnOnce(&mut EventLoop, io::Result<usize>, Vec<u8>) + 'static,
 {
-    Box::new(move |el, out| match out {
+    Box::new(move |el: &mut EventLoop, out: Output| match out {
         Output::Bytes(res, buf) => cb(el, res, buf),
         other => mismatch(other),
     })
@@ -284,7 +293,7 @@ fn fd_cb<F>(cb: F) -> Callback
 where
     F: FnOnce(&mut EventLoop, io::Result<OwnedFd>) + 'static,
 {
-    Box::new(move |el, out| match out {
+    Box::new(move |el: &mut EventLoop, out: Output| match out {
         Output::Fd(res) => cb(el, res),
         other => mismatch(other),
     })
@@ -294,7 +303,7 @@ fn metadata_cb<F>(cb: F) -> Callback
 where
     F: FnOnce(&mut EventLoop, io::Result<Metadata>) + 'static,
 {
-    Box::new(move |el, out| match out {
+    Box::new(move |el: &mut EventLoop, out: Output| match out {
         Output::Metadata(res) => cb(el, res),
         other => mismatch(other),
     })

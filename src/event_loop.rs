@@ -73,7 +73,7 @@ impl EventLoop {
     fn dispatch(&mut self) {
         // Reap everything first: callbacks need `&mut self`, so they cannot run
         // while the ring is borrowed.
-        let mut completed = std::mem::take(&mut self.completed);
+        let mut completed: Vec<Completion> = std::mem::take(&mut self.completed);
         self.ring.reap(&mut completed);
         // Every reaped completion must be delivered, even if a callback calls
         // `stop()`: the CQEs are already consumed.
@@ -87,7 +87,7 @@ impl EventLoop {
 
     /// Hands `op` to the driver and registers `cb` for its completion.
     pub(crate) fn push(&mut self, op: Op, cb: Callback) -> OpId {
-        let id = self.ring.push(op);
+        let id: u64 = self.ring.push(op);
         self.callbacks.insert(id, cb);
         OpId(id)
     }
