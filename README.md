@@ -1,2 +1,3 @@
 # iorca
-IO event poll for linux
+
+IO Rust Completion-based Asynchronous event-driven lib for modern Linux OS

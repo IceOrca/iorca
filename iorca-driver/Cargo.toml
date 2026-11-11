@@ -1,0 +1,15 @@
+[package]
+name = "iorca-driver"
+version.workspace = true
+edition.workspace = true
+description = "Safe, ownership-based io_uring driver for iorca (holds all of iorca's unsafe code)"
+keywords = ["io-uring", "linux"]
+categories = ["os::linux-apis"]
+
+[dependencies]
+io-uring.workspace = true
+libc.workspace = true
+socket2.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

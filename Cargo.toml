@@ -1,0 +1,31 @@
+[workspace]
+members = ["iorca-driver"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+iorca-driver = { path = "iorca-driver", version = "0.1.0" }
+io-uring = "*"
+libc = "*"
+socket2 = "*"
+
+[package]
+name = "iorca"
+version.workspace = true
+edition.workspace = true
+description = "Completion-based, callback-driven I/O event loop on top of io_uring"
+readme = "README.md"
+keywords = ["io-uring", "event-loop", "io", "linux"]
+categories = ["asynchronous", "network-programming", "os::linux-apis"]
+
+[dependencies]
+iorca-driver.workspace = true
+
+[dev-dependencies]
+libc.workspace = true
+
+# All unsafe code lives in `iorca-driver`; this crate must stay free of it.
+[lints.rust]
+unsafe_code = "forbid"
