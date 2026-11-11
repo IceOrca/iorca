@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-iorca is a Linux-only Rust library for completion-based, event-driven I/O on top of `io_uring` (via the `io-uring` crate), modelled loosely on tokio-uring but **without async/await**: each operation takes a callback that the event loop invokes on completion. Requires Linux ≥ 5.19 (`IORING_OP_SOCKET`).
+iorca is a Linux-only Rust library for completion-based, event-driven I/O on top of `io_uring` (via the `io-uring` crate), modelled loosely on tokio-rs/mio and **without async/await**: each operation takes a callback that the event loop invokes on completion. Requires Linux ≥ 5.19 (`IORING_OP_SOCKET`).
 
 ## Commands
 
@@ -16,6 +16,8 @@ docker compose run --rm dev cargo build --workspace --all-targets
 docker compose run --rm dev cargo test --test net udp_       # one test file (ops, net, fs, handles) / name filter
 docker compose run --rm dev cargo test -p iorca-driver       # driver unit tests only
 docker compose run --rm dev cargo run --example timer        # Timer + deadline demo; also: cat -- <file>, echo_server [addr], udp_echo [addr], unix_datagram
+docker compose run --rm dev cargo run -p iosh                # interactive shell example (compose allocates a tty)
+docker compose run --rm dev cargo test -p iosh               # shell unit + end-to-end tests
 docker compose run --rm dev cargo clippy --workspace --all-targets -- -D warnings
 docker compose run --rm dev cargo fmt --all --check
 ```
@@ -26,9 +28,9 @@ docker compose run --rm dev cargo fmt --all --check
 
 ## Architecture
 
-Cargo workspace with two crates. All `unsafe` code is confined to `iorca-driver`, which is `#![deny(unsafe_code)]` with exactly two `#[allow(unsafe_code)]` sites: the SQ push in `Ring::flush_backlog` and `adopt_fd` (raw fd → `OwnedFd`). Both are inherent to io_uring. `iorca` sets `unsafe_code = "forbid"` in its `Cargo.toml`.
+Cargo workspace with two library crates plus the `iosh` example crate. All `unsafe` code is confined to `iorca-driver`, which is `#![deny(unsafe_code)]` with exactly two `#[allow(unsafe_code)]` sites: the SQ push in `Ring::flush_backlog` and `adopt_fd` (raw fd → `OwnedFd`). Both are inherent to io_uring. `iorca` sets `unsafe_code = "forbid"` in its `Cargo.toml`.
 
-- **`iorca-driver/`**: a safe, ownership-based io_uring wrapper, analogous to tokio-uring's `driver` module.
+- **`iorca-driver/`**: a safe, ownership-based io_uring wrapper, analogous to tokio-rs/tokio-uring's `driver` module.
   - `op.rs`: public `Op` enum (taken **by value**: `Vec<u8>` buffers, `OwnedFd`s, `SockAddr`, `PathBuf`) and `Output` (`Unit`, `Bytes(res, buf)`, `Datagram(res<(n, SockAddr)>, buf)`, `Fd(res)`, `Metadata(res)`). Each `Op` variant documents its `Output` variant.
   - `inflight.rs`: `prepare()` turns an `Op` into an SQE plus an `InFlight` holding every resource the SQE points into; `InFlight::finish()` converts the CQE result and hands resources back. `sendmsg`/`recvmsg` use a boxed `MsgState<A>` (msghdr + iovec + address `A`: the `SockAddr` for send, an `AddrBuf` for recv). Pre-submission failures (NUL in path, bad `OpenOptions`) become `InFlight::Ready(output)` sent as a `Nop`.
   - `ring.rs`: `Ring` (`push`, `submit_and_wait`, `reap`). SQEs wait in a `backlog` and reach the kernel only in `flush_backlog`. Multishot: a CQE flagged `IORING_CQE_F_MORE` yields a `Completion { more: true }` via `InFlight::more(&self)` and leaves the `InFlight` in the map; only the final CQE removes it. `Op::TimeoutMultishot` (Linux ≥ 6.4) is currently the only multishot op.
@@ -50,3 +52,15 @@ Cargo workspace with two crates. All `unsafe` code is confined to `iorca-driver`
 Add a variant to `Op` (`op.rs`) and `InFlight` if it needs new resources, build its SQE in `prepare()` (`inflight.rs`), convert the result in `InFlight::finish()`, then add the `EventLoop` method in `src/ops.rs`. Invariant for the driver: every pointer in an SQE must target heap memory (`Vec` contents, a `CString`, or a `Box` created *before* taking the pointer) owned by that op's `InFlight`, which stays in `Ring::in_flight` until its CQE is reaped. `Drop for Ring` deliberately leaks pending `InFlight`s because the kernel may still access them. Prefer safe workarounds over new `unsafe`: e.g. `fill()` zero-fills read buffers and truncates instead of using `set_len`. Don't add `unsafe` for C structs: add a layout-checked type to `abi.rs` instead (own `#[repr(C)]` mirror or byte buffer + `offset_of!`, with `const` asserts against the `libc` type). Any `unsafe` needs `#[allow(unsafe_code)]` and a `SAFETY:` comment (clippy's `undocumented_unsafe_blocks` is denied in the driver).
 
 Buffer conventions: read-like ops (`read`, `recv`) fill from the start up to `capacity()`, then the buffer is truncated to `n` (restored to its original length on error); write-like ops (`write`, `send`) use `buf[..len()]` and may complete short. Both return the `Vec`. Raw ops take `RawFd`, and callers keep the fd open themselves (typed handles do this for them). Errors before submission come back through the normal completion (via a `Nop` SQE), never synchronously.
+
+### `examples/iosh` (external example crate)
+
+A small interactive shell that uses iorca as its event loop: a workspace member (`publish = false`, `unsafe_code = "forbid"`) that depends on `iorca` like an outside user would, plus `signal-hook` (signals → socket pair, read by the loop) and `rustix` (safe `kill` for forwarding SIGTERM/SIGHUP/SIGCONT, `termios` for the editor; tests also use `pty`). It sits at `examples/iosh/src/main.rs`, so cargo's example auto-discovery (`examples/*.rs`, `examples/*/main.rs`) ignores it.
+
+- `parse.rs`: lexer/parser to `List` of `(Connector, Pipeline)`; words keep `Part`s (`Lit`/`Var`/`Status`/`Tilde`) and are expanded at run time (no field splitting or globbing).
+- `edit.rs`: pure line editor (`Editor::feed(bytes, history) -> Fed { output, finish, rest }`): decodes keys/escape sequences/UTF-8 split across reads, ↑/↓ history with the draft kept, cursor/kill keys, renders `\r` + prompt + line + `ESC[K`. No I/O, unit-tested.
+- `history.rs`: in-memory history and `!!`/`!N`/`!-N`/`!prefix` expansion; file is `$IOSH_HISTFILE`, or `~/.iosh_history` when interactive.
+- `shell.rs`: `Shell` state in `Rc<RefCell<..>>`; `Console` serializes stdout/stderr writes (io_uring may reorder concurrent writes) and `after_output` holds pipelines until it drains; stdin is read **only while waiting for a line** so foreground children get the terminal; on a tty, `request_line` runs an `Editor` session with the terminal non-canonical (ICANON/ECHO/IEXTEN off, ISIG kept so Ctrl+C/\\/Z still signal) and `finish_edit` restores the startup termios before the line runs (also on Ctrl+C reset and `shutdown`); keys typed past Enter are kept in `input.keys` for the next session; signal handling (SIGINT at prompt vs during a job, `sigint_expected` for the SIGINT/SIGCHLD race); `shutdown` saves history, flushes, `el.stop()`.
+- `exec.rs`: a pipeline is a `Job` (children reaped with `try_wait` on SIGCHLD, plus a count of shell-side iorca writes). External→external pipes are OS pipes; anything the shell writes (builtin output, heredoc bodies) goes through iorca (`File::write_all_at` for files, `UnixStream::write_all` via socket pairs for pipes).
+- `tests/shell.rs` `line_editor_history_and_keys` drives iosh on a pty it opens itself (not a controlling tty, so no signals) and syncs on output plus `ICANON` being off (the prompt is up), not on sleeps.
+- Testing interactively: `script -qfec "exec iosh" /dev/null` with timed control bytes (`\003` Ctrl+C, `\034` Ctrl+\\, `\032` Ctrl+Z, `\004` Ctrl+D). The `exec` matters: otherwise `script`'s `sh -c` wrapper shares the process group, dies of SIGQUIT, and hangs up the pty.

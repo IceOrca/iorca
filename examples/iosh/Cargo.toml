@@ -1,0 +1,25 @@
+[package]
+name = "iosh"
+version.workspace = true
+edition.workspace = true
+description = "A small interactive shell built on the iorca event loop"
+publish = false
+
+[[bin]]
+name = "iosh"
+path = "src/main.rs"
+
+[dependencies]
+iorca.workspace = true
+# Safe signal-to-pipe forwarding (the self-pipe trick): the loop reads the pipe.
+signal-hook.workspace = true
+# Safe kill(2), to forward SIGTERM/SIGHUP/SIGCONT to running children, and
+# termios for the line editor's terminal mode.
+rustix = { workspace = true, features = ["termios"] }
+
+[dev-dependencies]
+# A pseudo-terminal to drive the line editor in tests.
+rustix = { workspace = true, features = ["pty", "termios"] }
+
+[lints.rust]
+unsafe_code = "forbid"

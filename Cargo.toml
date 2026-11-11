@@ -1,14 +1,17 @@
 [workspace]
-members = ["iorca-driver"]
+members = ["iorca-driver", "examples/iosh"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
+iorca = { path = ".", version = "0.1.0" }
 iorca-driver = { path = "iorca-driver", version = "0.1.0" }
 io-uring = "*"
 libc = "*"
+rustix = { version = "*", features = ["process"] }
+signal-hook = "*"
 socket2 = "*"
 
 [package]
