@@ -1,26 +1,41 @@
-//! Prints a tick every 500ms, five times, by re-arming a timeout from its own
-//! callback.
+//! Timers: an interval that ticks every 500ms and stops itself after five
+//! ticks, a one-shot timer, and a deadline on a UDP receive nobody answers.
 
-use std::io;
+use std::io::{self, ErrorKind};
 use std::time::Duration;
 
-use iorca::EventLoop;
+use iorca::{EventLoop, OpId, Timer, UdpSocket};
 
 fn main() -> io::Result<()> {
     let mut el: EventLoop = EventLoop::new()?;
-    tick(&mut el, 1);
-    el.run()
-}
 
-fn tick(el: &mut EventLoop, n: u32) {
-    el.timeout(
+    let mut n: u32 = 0;
+    Timer::interval(
+        &mut el,
         Duration::from_millis(500),
-        move |el: &mut EventLoop, res: io::Result<()>| {
-            res.expect("timeout failed");
+        move |el: &mut EventLoop, timer: &Timer| {
+            n += 1;
             println!("tick {n}");
-            if n < 5 {
-                tick(el, n + 1);
+            if n == 5 {
+                timer.cancel(el);
             }
         },
     );
+
+    Timer::after(&mut el, Duration::from_millis(1200), |_: &mut EventLoop| {
+        println!("one-shot fired after 1.2s");
+    });
+
+    let sock: UdpSocket = UdpSocket::bind("127.0.0.1:0")?;
+    let recv: OpId = sock.recv_from(
+        &mut el,
+        Vec::with_capacity(1500),
+        |_: &mut EventLoop, res: io::Result<(usize, std::net::SocketAddr)>, _: Vec<u8>| match res {
+            Err(e) if e.kind() == ErrorKind::TimedOut => println!("recv timed out after 2s"),
+            other => println!("recv: {other:?}"),
+        },
+    );
+    el.deadline(recv, Duration::from_secs(2));
+
+    el.run()
 }

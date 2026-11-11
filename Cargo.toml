@@ -22,8 +22,6 @@ categories = ["asynchronous", "network-programming", "os::linux-apis"]
 
 [dependencies]
 iorca-driver.workspace = true
-
-[dev-dependencies]
 libc.workspace = true
 
 # All unsafe code lives in `iorca-driver`; this crate must stay free of it.

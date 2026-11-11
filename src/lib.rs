@@ -34,6 +34,14 @@
 //! * **Raw ops** on [`EventLoop`] (`read`, `send_to`, `open`, `statx`, ...)
 //!   take a [`RawFd`](std::os::fd::RawFd). You keep the fd open yourself.
 //!
+//! ## Timers
+//!
+//! [`Timer::after`], [`Timer::at`] and [`Timer::interval`] give one-shot and
+//! drift-free repeating timers you can [`cancel`](Timer::cancel).
+//! [`EventLoop::deadline`] bounds any op by time: if it hasn't completed by
+//! then, it is cancelled and its callback gets `ErrorKind::TimedOut`. The raw
+//! [`EventLoop::timeout`] op is the building block for both.
+//!
 //! ## Example
 //!
 //! ```no_run
@@ -61,9 +69,11 @@ mod filesystem;
 mod io;
 mod network;
 mod ops;
+mod timer;
 
 pub use event_loop::{EventLoop, OpId};
 pub use filesystem::{File, metadata};
 pub use io::{Stderr, Stdin, Stdout, stderr, stdin, stdout};
 pub use iorca_driver::{Domain, Metadata, OpenOptions, Protocol, SockAddr, Type};
 pub use network::{TcpListener, TcpStream, UdpSocket, UnixDatagram, UnixListener, UnixStream};
+pub use timer::Timer;

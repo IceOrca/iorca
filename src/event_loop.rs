@@ -1,7 +1,11 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::io;
+use std::os::fd::OwnedFd;
+use std::rc::Rc;
+use std::time::Duration;
 
-use iorca_driver::{Completion, Op, Output, Ring};
+use iorca_driver::{Completion, Metadata, Op, Output, Ring, SockAddr};
 
 /// Internal completion handler, invoked with the driver's typed [`Output`].
 pub(crate) type Callback = Box<dyn FnOnce(&mut EventLoop, Output)>;
@@ -70,6 +74,43 @@ impl EventLoop {
         Ok(())
     }
 
+    /// Cancels `op` if it has not completed within `after`.
+    ///
+    /// When the deadline passes first, `op`'s callback gets an error of kind
+    /// [`ErrorKind::TimedOut`](io::ErrorKind::TimedOut) (`ETIMEDOUT`), with any
+    /// buffer handed back as usual. When `op` completes first, the deadline
+    /// timer is cancelled, so it does not keep [`run`](Self::run) waiting.
+    ///
+    /// Returns `false`, and does nothing, if `op` has already completed.
+    ///
+    /// The deadline applies to that one op: for chained helpers such as
+    /// `write_all` or `tcp_connect`, only the first step is covered. An op the
+    /// kernel cannot interrupt (e.g. regular file I/O already in progress)
+    /// completes normally despite the deadline.
+    pub fn deadline(&mut self, op: OpId, after: Duration) -> bool {
+        let Some(cb): Option<Callback> = self.callbacks.remove(&op.0) else {
+            return false;
+        };
+        let expired: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let e: Rc<Cell<bool>> = Rc::clone(&expired);
+        let timer: OpId = self.timeout(after, move |el: &mut EventLoop, res: io::Result<()>| {
+            if res.is_ok() {
+                e.set(true);
+                el.cancel(op, |_: &mut EventLoop, _: io::Result<()>| {});
+            }
+        });
+        let wrapped: Callback = Box::new(move |el: &mut EventLoop, output: Output| {
+            if expired.get() {
+                cb(el, timed_out(output));
+            } else {
+                el.cancel(timer, |_: &mut EventLoop, _: io::Result<()>| {});
+                cb(el, output);
+            }
+        });
+        self.callbacks.insert(op.0, wrapped);
+        true
+    }
+
     fn dispatch(&mut self) {
         // Reap everything first: callbacks need `&mut self`, so they cannot run
         // while the ring is borrowed.
@@ -90,5 +131,25 @@ impl EventLoop {
         let id: u64 = self.ring.push(op);
         self.callbacks.insert(id, cb);
         OpId(id)
+    }
+}
+
+/// Turns the `ECANCELED` caused by an expired deadline into `ETIMEDOUT`.
+/// Other results (the op won the race, or failed on its own) pass through.
+fn timed_out(output: Output) -> Output {
+    fn map<T>(res: io::Result<T>) -> io::Result<T> {
+        match res {
+            Err(e) if e.raw_os_error() == Some(libc::ECANCELED) => {
+                Err(io::Error::from_raw_os_error(libc::ETIMEDOUT))
+            }
+            other => other,
+        }
+    }
+    match output {
+        Output::Unit(res) => Output::Unit(map::<()>(res)),
+        Output::Bytes(res, buf) => Output::Bytes(map::<usize>(res), buf),
+        Output::Datagram(res, buf) => Output::Datagram(map::<(usize, SockAddr)>(res), buf),
+        Output::Fd(res) => Output::Fd(map::<OwnedFd>(res)),
+        Output::Metadata(res) => Output::Metadata(map::<Metadata>(res)),
     }
 }
