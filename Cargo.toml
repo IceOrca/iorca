@@ -9,10 +9,13 @@ edition = "2024"
 iorca = { path = ".", version = "0.1.0" }
 iorca-driver = { path = "iorca-driver", version = "0.1.0" }
 io-uring = "*"
+landlock = "*"
 libc = "*"
 rustix = { version = "*", features = ["process"] }
+serde = { version = "*", features = ["derive"] }
 signal-hook = "*"
 socket2 = "*"
+toml = "*"
 
 [package]
 name = "iorca"

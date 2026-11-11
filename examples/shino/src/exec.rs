@@ -24,6 +24,7 @@ use signal_hook::consts::{
 
 use crate::builtins::{self, Outcome};
 use crate::parse::{self, Connector, Env, Pipeline, Redirect, RedirectKind};
+use crate::sandbox::Policy;
 use crate::shell::{self, Done, Out, Sh, os_msg};
 
 /// Receives a finished pipeline's status and whether it was interrupted
@@ -196,7 +197,12 @@ impl Fds {
 
     /// Applies redirections left to right, opening files synchronously (the
     /// fds go to a child or to iorca writes).
-    fn apply(&mut self, redirects: &[Redirect], env: &dyn Env) -> Result<(), String> {
+    fn apply(
+        &mut self,
+        redirects: &[Redirect],
+        env: &dyn Env,
+        sandbox: Option<&Policy>,
+    ) -> Result<(), String> {
         for redirect in redirects {
             let fd: usize = usize::from(redirect.fd);
             let slot: Slot = match &redirect.kind {
@@ -209,6 +215,9 @@ impl Fds {
                 RedirectKind::Write(word) | RedirectKind::Append(word) => {
                     let append: bool = matches!(redirect.kind, RedirectKind::Append(_));
                     let path: String = target_path(word, env)?;
+                    if let Some(policy) = sandbox {
+                        policy.check_write(std::path::Path::new(&path))?;
+                    }
                     let file: fs::File = fs::OpenOptions::new()
                         .write(true)
                         .create(true)
@@ -321,7 +330,16 @@ fn run_pipeline(el: &mut EventLoop, sh: &Sh, pipeline: Pipeline, done: JobDone) 
                 }
             }
         }
-        let applied: Result<(), String> = fds.apply(&command.redirects, &*sh.borrow());
+        let sandbox: Option<Rc<Policy>> = sh.borrow().sandbox.clone();
+        let applied: Result<(), String> =
+            fds.apply(&command.redirects, &*sh.borrow(), sandbox.as_deref());
+        // Sandbox: may this external command run?
+        let blocked: Option<String> = match &sandbox {
+            Some(policy) if !builtin && !argv.is_empty() => {
+                policy.check_command(&argv, &*sh.borrow()).err()
+            }
+            _ => None,
+        };
         let status: Option<i32> = match applied {
             Err(msg) => {
                 shell::error(el, sh, &msg);
@@ -338,6 +356,10 @@ fn run_pipeline(el: &mut EventLoop, sh: &Sh, pipeline: Pipeline, done: JobDone) 
                     }
                 }
                 Some(0)
+            }
+            Ok(()) if blocked.is_some() => {
+                shell::error(el, sh, &blocked.unwrap_or_default());
+                Some(126)
             }
             Ok(()) if builtin => Some(run_builtin(el, sh, &argv, fds, count == 1, &mut job)),
             Ok(()) => spawn(el, sh, &argv, &assigns, fds, last, &mut job),

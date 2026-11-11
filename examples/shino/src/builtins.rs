@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use crate::parse::Env;
 use crate::shell::{Sh, Shell, os_msg};
 
-const NAMES: [&str; 8] = [
-    "cd", "pwd", "echo", "exit", "history", "export", "unset", "help",
+const NAMES: [&str; 9] = [
+    "cd", "pwd", "echo", "exit", "history", "export", "unset", "sandbox", "help",
 ];
 
 const HELP: &str = "\
@@ -22,6 +22,7 @@ builtins:
   export [NAME=val]   set an environment variable (no args: list them)
   NAME=val [cmd]      set a variable (exported), or set it for cmd only
   unset NAME...       remove environment variables
+  sandbox             show the sandbox policy (shino --sandbox [FILE])
   help                this text
 
 syntax:
@@ -110,6 +111,12 @@ pub fn run(sh: &Sh, argv: &[String], effects: bool) -> Outcome {
             }
             Outcome::default()
         }
+        "sandbox" => match &s.sandbox {
+            Some(policy) => Outcome::ok(policy.summary()),
+            None => Outcome::ok(String::from(
+                "sandbox: off (start shino with --sandbox [FILE])\n",
+            )),
+        },
         _ => Outcome::ok(String::from(HELP)),
     }
 }
@@ -125,6 +132,11 @@ fn cd(s: &mut Shell, args: &[String], effects: bool) -> Outcome {
         let which: &str = if dash { "OLDPWD" } else { "HOME" };
         return Outcome::fail(1, format!("cd: {which} not set"));
     };
+    if let Some(policy) = &s.sandbox
+        && let Err(msg) = policy.check_cd(Path::new(&target))
+    {
+        return Outcome::fail(1, msg);
+    }
     if !effects {
         return if Path::new(&target).is_dir() {
             Outcome::default()

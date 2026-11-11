@@ -24,6 +24,7 @@ use crate::edit::{Editor, Fed, Finish};
 use crate::exec::{self, Job};
 use crate::history::History;
 use crate::parse::{self, Env, List};
+use crate::sandbox::Policy;
 
 /// The shell, shared by every callback.
 pub type Sh = Rc<RefCell<Shell>>;
@@ -58,6 +59,8 @@ pub struct Shell {
     raw: bool,
     /// The line being edited, while the prompt is up.
     edit: Option<Editor>,
+    /// Sandbox mode's policy, if on.
+    pub sandbox: Option<Rc<Policy>>,
     /// The pipeline that is running, if any.
     pub job: Option<Job>,
     /// Ctrl+C arrived while a job was running: abort the rest of the line.
@@ -131,7 +134,12 @@ impl Env for Shell {
 
 impl Shell {
     /// `script` (from `-c`) replaces stdin as the source of lines.
-    pub fn new(interactive: bool, script: Option<String>, hist_path: Option<PathBuf>) -> Sh {
+    pub fn new(
+        interactive: bool,
+        script: Option<String>,
+        hist_path: Option<PathBuf>,
+        sandbox: Option<Rc<Policy>>,
+    ) -> Sh {
         let mut input: Input = Input::default();
         if let Some(script) = script {
             input.lines = script
@@ -160,6 +168,7 @@ impl Shell {
             sigint_expected: false,
             exiting: false,
             exit_code: 0,
+            sandbox,
         }))
     }
 }
@@ -168,6 +177,16 @@ impl Shell {
 pub fn start(el: &mut EventLoop, sh: &Sh) -> io::Result<()> {
     for sig in [SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGTSTP, SIGCHLD] {
         watch_signal(el, sh, sig)?;
+    }
+    let banner: Option<String> = {
+        let s: std::cell::Ref<'_, Shell> = sh.borrow();
+        s.sandbox
+            .as_ref()
+            .filter(|_: &&Rc<Policy>| -> bool { s.interactive })
+            .map(|p: &Rc<Policy>| -> String { p.banner() })
+    };
+    if let Some(banner) = banner {
+        print(el, sh, Out::Stderr, banner.into_bytes(), None);
     }
     let path: Option<PathBuf> = sh.borrow().hist_path.clone();
     match path {

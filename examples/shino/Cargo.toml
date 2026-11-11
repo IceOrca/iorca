@@ -17,6 +17,12 @@ signal-hook.workspace = true
 # termios for the line editor's terminal mode.
 rustix = { workspace = true, features = ["termios"] }
 
+# Sandbox: Landlock (kernel-enforced exec/file/network rules) and the
+# TOML policy file.
+landlock.workspace = true
+serde.workspace = true
+toml.workspace = true
+
 [dev-dependencies]
 # A pseudo-terminal to drive the line editor in tests.
 rustix = { workspace = true, features = ["pty", "termios"] }
