@@ -3,7 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 
-use io_uring::{IoUring, squeue};
+use io_uring::{IoUring, cqueue, squeue};
 
 use crate::inflight::{InFlight, prepare};
 use crate::op::{Completion, Op};
@@ -69,10 +69,21 @@ impl Ring {
     pub fn reap(&mut self, out: &mut Vec<Completion>) {
         for cqe in self.ring.completion() {
             let id: u64 = cqe.user_data();
-            if let Some(resources) = self.in_flight.remove(&id) {
+            let res: i32 = cqe.result();
+            if cqueue::more(cqe.flags()) {
+                // Multishot: the kernel keeps using this op's resources.
+                if let Some(resources) = self.in_flight.get(&id) {
+                    out.push(Completion {
+                        id,
+                        output: resources.more(res),
+                        more: true,
+                    });
+                }
+            } else if let Some(resources) = self.in_flight.remove(&id) {
                 out.push(Completion {
                     id,
-                    output: resources.finish(cqe.result()),
+                    output: resources.finish(res),
+                    more: false,
                 });
             }
         }
@@ -89,7 +100,8 @@ impl Ring {
             // SAFETY: every pointer in `entry` was built by `prepare` and refers
             // to heap memory owned by the matching `InFlight` in
             // `self.in_flight`. That entry is removed only in `reap`, after the
-            // kernel posted the CQE, and is leaked by `Drop` if the ring dies
+            // kernel posted the op's final CQE (one without
+            // `IORING_CQE_F_MORE`), and is leaked by `Drop` if the ring dies
             // first. So the memory outlives the kernel's use of it.
             let pushed: bool = unsafe { sq.push(entry) }.is_ok();
             if !pushed {
@@ -128,6 +140,50 @@ mod tests {
         }
         assert_eq!(out[0].id, id);
         assert!(matches!(out[0].output, Output::Unit(Ok(()))));
+        assert_eq!(ring.in_flight(), 0);
+    }
+
+    #[test]
+    fn multishot_timeout_stays_in_flight_until_last_tick() {
+        let mut ring: Ring = Ring::new(4).unwrap();
+        let id: u64 = ring.push(Op::TimeoutMultishot {
+            period: Duration::from_millis(1),
+            count: 3,
+        });
+        let mut out: Vec<Completion> = Vec::new();
+        while out.len() < 3 {
+            ring.submit_and_wait().unwrap();
+            ring.reap(&mut out);
+            let last_more: bool = out.last().is_some_and(|c: &Completion| -> bool { c.more });
+            assert_eq!(ring.in_flight(), usize::from(out.is_empty() || last_more));
+        }
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|c: &Completion| -> bool {
+            c.id == id && matches!(c.output, Output::Unit(Ok(())))
+        }));
+        let more: Vec<bool> = out
+            .iter()
+            .map(|c: &Completion| -> bool { c.more })
+            .collect::<Vec<bool>>();
+        assert_eq!(more, vec![true, true, false]);
+    }
+
+    #[test]
+    fn multishot_zero_period_is_rejected() {
+        let mut ring: Ring = Ring::new(4).unwrap();
+        ring.push(Op::TimeoutMultishot {
+            period: Duration::ZERO,
+            count: 0,
+        });
+        let mut out: Vec<Completion> = Vec::new();
+        while out.is_empty() {
+            ring.submit_and_wait().unwrap();
+            ring.reap(&mut out);
+        }
+        assert!(!out[0].more);
+        assert!(
+            matches!(&out[0].output, Output::Unit(Err(e)) if e.kind() == io::ErrorKind::InvalidInput)
+        );
         assert_eq!(ring.in_flight(), 0);
     }
 

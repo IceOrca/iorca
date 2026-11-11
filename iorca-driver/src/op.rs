@@ -21,6 +21,16 @@ pub enum Op {
     Nop,
     /// Completes with `Output::Unit(Ok(()))` after the duration elapses.
     Timeout(Duration),
+    /// Kernel-side periodic timer (`IORING_TIMEOUT_MULTISHOT`, Linux ≥ 6.4).
+    /// Completes with `Output::Unit(Ok(()))` once per expiry, every `period`;
+    /// every completion except the last has [`Completion::more`] set.
+    ///
+    /// `count` is the number of expiries, or 0 to repeat until cancelled
+    /// (the final completion is then `ECANCELED`). The kernel re-arms the
+    /// timer relative to each expiry, so the schedule is not anchored to the
+    /// start time. A zero `period` is rejected with `InvalidInput`; kernels
+    /// older than 6.4 reject the op with `EINVAL`.
+    TimeoutMultishot { period: Duration, count: u32 },
     /// Cancels the operation with id `target`. Completes with [`Output::Unit`].
     /// The target itself completes with `ECANCELED`.
     Cancel { target: u64 },
@@ -105,4 +115,8 @@ pub struct Completion {
     /// The id returned by [`Ring::push`](crate::Ring::push).
     pub id: u64,
     pub output: Output,
+    /// More completions with this id will follow. Only multishot ops set it;
+    /// the op stays in flight, with its resources, until a completion
+    /// without it.
+    pub more: bool,
 }

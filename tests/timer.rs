@@ -10,6 +10,9 @@ use iorca::{EventLoop, OpId, Timer};
 /// Result slot filled in by a callback and checked after `run()`.
 type Slot<T> = Rc<RefCell<Option<T>>>;
 
+/// A multishot tick as recorded by a test: `Ok(more)` or the raw errno.
+type Tick = Result<bool, Option<i32>>;
+
 #[test]
 fn after_fires_once() {
     let mut el: EventLoop = EventLoop::new().unwrap();
@@ -225,4 +228,71 @@ fn user_cancel_still_reports_ecanceled() {
     el.cancel(id, |_: &mut EventLoop, res: io::Result<()>| res.unwrap());
     el.run().unwrap();
     assert_eq!(err.get(), Some(libc::ECANCELED));
+}
+
+#[test]
+fn multishot_fires_count_times() {
+    let mut el: EventLoop = EventLoop::new().unwrap();
+    let start: Instant = Instant::now();
+    let ticks: Rc<RefCell<Vec<bool>>> = Rc::new(RefCell::new(Vec::new()));
+    let t: Rc<RefCell<Vec<bool>>> = ticks.clone();
+    el.timeout_multishot(
+        Duration::from_millis(10),
+        3,
+        move |_: &mut EventLoop, res: io::Result<bool>| t.borrow_mut().push(res.unwrap()),
+    );
+    el.run().unwrap();
+    assert_eq!(*ticks.borrow(), vec![true, true, false]);
+    assert!(start.elapsed() >= Duration::from_millis(30));
+    assert_eq!(el.in_flight(), 0);
+}
+
+#[test]
+fn multishot_repeats_until_cancelled() {
+    let mut el: EventLoop = EventLoop::new().unwrap();
+    let results: Rc<RefCell<Vec<Tick>>> = Rc::new(RefCell::new(Vec::new()));
+    let r: Rc<RefCell<Vec<Tick>>> = results.clone();
+    let id: Rc<Cell<Option<OpId>>> = Rc::new(Cell::new(None));
+    let i: Rc<Cell<Option<OpId>>> = id.clone();
+    let op: OpId = el.timeout_multishot(
+        Duration::from_millis(5),
+        0,
+        move |el: &mut EventLoop, res: io::Result<bool>| {
+            r.borrow_mut()
+                .push(res.map_err(|e: io::Error| -> Option<i32> { e.raw_os_error() }));
+            if r.borrow().len() == 4 {
+                el.cancel(
+                    i.get().unwrap(),
+                    |_: &mut EventLoop, res: io::Result<()>| res.unwrap(),
+                );
+            }
+        },
+    );
+    id.set(Some(op));
+    // A multishot op can't take a deadline.
+    assert!(!el.deadline(op, Duration::from_secs(1)));
+    el.run().unwrap();
+    // The cancel may race one more tick; the op always ends with ECANCELED.
+    let results: Vec<Tick> = results.take();
+    let (last, ticks): (&Tick, &[Tick]) = results.split_last().unwrap();
+    assert_eq!(*last, Err(Some(libc::ECANCELED)));
+    assert!(ticks.len() >= 4);
+    assert!(ticks.iter().all(|t: &Tick| -> bool { *t == Ok(true) }));
+    assert_eq!(el.in_flight(), 0);
+}
+
+#[test]
+fn multishot_zero_period_is_rejected() {
+    let mut el: EventLoop = EventLoop::new().unwrap();
+    let kinds: Rc<RefCell<Vec<ErrorKind>>> = Rc::new(RefCell::new(Vec::new()));
+    let k: Rc<RefCell<Vec<ErrorKind>>> = kinds.clone();
+    el.timeout_multishot(
+        Duration::ZERO,
+        0,
+        move |_: &mut EventLoop, res: io::Result<bool>| {
+            k.borrow_mut().push(res.unwrap_err().kind())
+        },
+    );
+    el.run().unwrap();
+    assert_eq!(*kinds.borrow(), vec![ErrorKind::InvalidInput]);
 }

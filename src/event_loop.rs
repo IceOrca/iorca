@@ -10,6 +10,18 @@ use iorca_driver::{Completion, Metadata, Op, Output, Ring, SockAddr};
 /// Internal completion handler, invoked with the driver's typed [`Output`].
 pub(crate) type Callback = Box<dyn FnOnce(&mut EventLoop, Output)>;
 
+/// Handler for a multishot op, invoked once per completion. The `bool` is
+/// [`Completion::more`]: false on the final call.
+pub(crate) type MultiCallback = Box<dyn FnMut(&mut EventLoop, Output, bool)>;
+
+/// What runs when an op completes.
+enum Handler {
+    /// Single-completion op: runs once and is dropped.
+    Once(Callback),
+    /// Multishot op: stays registered until the final completion.
+    Multi(MultiCallback),
+}
+
 /// Identifies a submitted operation. Pass it to [`EventLoop::cancel`] to
 /// cancel the operation.
 ///
@@ -22,7 +34,7 @@ pub struct EventLoop {
     /// Owns the ring and every resource the kernel can touch.
     ring: Ring,
     /// User callbacks for in-flight operations, keyed by op id.
-    callbacks: HashMap<u64, Callback>,
+    callbacks: HashMap<u64, Handler>,
     /// Scratch buffer for reaped completions, reused across turns.
     completed: Vec<Completion>,
     stopped: bool,
@@ -81,15 +93,21 @@ impl EventLoop {
     /// buffer handed back as usual. When `op` completes first, the deadline
     /// timer is cancelled, so it does not keep [`run`](Self::run) waiting.
     ///
-    /// Returns `false`, and does nothing, if `op` has already completed.
+    /// Returns `false`, and does nothing, if `op` has already completed or is
+    /// a multishot op (such as [`timeout_multishot`](Self::timeout_multishot)).
     ///
     /// The deadline applies to that one op: for chained helpers such as
     /// `write_all` or `tcp_connect`, only the first step is covered. An op the
     /// kernel cannot interrupt (e.g. regular file I/O already in progress)
     /// completes normally despite the deadline.
     pub fn deadline(&mut self, op: OpId, after: Duration) -> bool {
-        let Some(cb): Option<Callback> = self.callbacks.remove(&op.0) else {
-            return false;
+        let cb: Callback = match self.callbacks.remove(&op.0) {
+            Some(Handler::Once(cb)) => cb,
+            Some(multi) => {
+                self.callbacks.insert(op.0, multi);
+                return false;
+            }
+            None => return false,
         };
         let expired: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let e: Rc<Cell<bool>> = Rc::clone(&expired);
@@ -107,7 +125,7 @@ impl EventLoop {
                 cb(el, output);
             }
         });
-        self.callbacks.insert(op.0, wrapped);
+        self.callbacks.insert(op.0, Handler::Once(wrapped));
         true
     }
 
@@ -119,8 +137,18 @@ impl EventLoop {
         // Every reaped completion must be delivered, even if a callback calls
         // `stop()`: the CQEs are already consumed.
         for completion in completed.drain(..) {
-            if let Some(cb) = self.callbacks.remove(&completion.id) {
-                cb(self, completion.output);
+            let Completion { id, output, more }: Completion = completion;
+            match self.callbacks.remove(&id) {
+                Some(Handler::Once(cb)) => cb(self, output),
+                Some(Handler::Multi(mut cb)) => {
+                    // Taken out of the map while it runs, because it gets
+                    // `&mut self`; put back if more completions will follow.
+                    cb(self, output, more);
+                    if more {
+                        self.callbacks.insert(id, Handler::Multi(cb));
+                    }
+                }
+                None => {}
             }
         }
         self.completed = completed;
@@ -129,7 +157,15 @@ impl EventLoop {
     /// Hands `op` to the driver and registers `cb` for its completion.
     pub(crate) fn push(&mut self, op: Op, cb: Callback) -> OpId {
         let id: u64 = self.ring.push(op);
-        self.callbacks.insert(id, cb);
+        self.callbacks.insert(id, Handler::Once(cb));
+        OpId(id)
+    }
+
+    /// Like [`push`](Self::push), for a multishot op whose `cb` runs once per
+    /// completion.
+    pub(crate) fn push_multi(&mut self, op: Op, cb: MultiCallback) -> OpId {
+        let id: u64 = self.ring.push(op);
+        self.callbacks.insert(id, Handler::Multi(cb));
         OpId(id)
     }
 }

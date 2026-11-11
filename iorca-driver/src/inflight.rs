@@ -14,6 +14,7 @@ use std::io;
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use io_uring::{opcode, squeue, types};
 use socket2::SockAddr;
@@ -66,6 +67,16 @@ pub(crate) struct MsgState<A> {
 }
 
 impl InFlight {
+    /// Converts a CQE flagged `IORING_CQE_F_MORE`. The op stays in flight and
+    /// keeps its resources, which the kernel is still using. Only multishot
+    /// timeouts post such CQEs.
+    pub(crate) fn more(&self, res: i32) -> Output {
+        match self {
+            InFlight::Timeout(_) => Output::Unit(timeout_result(res)),
+            _ => Output::Unit(cvt(res).map(drop)),
+        }
+    }
+
     /// Converts the CQE result into the typed output, handing resources back.
     pub(crate) fn finish(self, res: i32) -> Output {
         match self {
@@ -73,12 +84,7 @@ impl InFlight {
             InFlight::Timeout(ts) => {
                 // The kernel is done with the timespec now.
                 drop(ts);
-                // A pure timer completes with -ETIME when it expires.
-                if res == -libc::ETIME {
-                    Output::Unit(Ok(()))
-                } else {
-                    Output::Unit(cvt(res).map(drop))
-                }
+                Output::Unit(timeout_result(res))
             }
             InFlight::Fill { mut buf, orig_len } => {
                 let res: io::Result<usize> = cvt(res).map(|n: u32| -> usize { n as usize });
@@ -134,12 +140,23 @@ pub(crate) fn prepare(op: Op) -> (squeue::Entry, InFlight) {
     match op {
         Op::Nop => (opcode::Nop::new().build(), InFlight::Unit),
         Op::Timeout(dur) => {
-            let ts: Box<types::Timespec> = Box::new(
-                types::Timespec::new()
-                    .sec(dur.as_secs())
-                    .nsec(dur.subsec_nanos()),
-            );
+            let ts: Box<types::Timespec> = timespec(dur);
             (opcode::Timeout::new(&*ts).build(), InFlight::Timeout(ts))
+        }
+        Op::TimeoutMultishot { period, count } => {
+            // A zero period would make the kernel fire continuously.
+            if period.is_zero() {
+                return ready(Output::Unit(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "multishot timeout period must be non-zero",
+                ))));
+            }
+            let ts: Box<types::Timespec> = timespec(period);
+            let entry: squeue::Entry = opcode::Timeout::new(&*ts)
+                .count(count)
+                .flags(types::TimeoutFlags::MULTISHOT)
+                .build();
+            (entry, InFlight::Timeout(ts))
         }
         Op::Cancel { target } => (opcode::AsyncCancel::new(target).build(), InFlight::Unit),
         Op::Read { fd, buf, offset } => {
@@ -317,6 +334,25 @@ fn fill(mut buf: Vec<u8>) -> (*mut u8, u32, Vec<u8>, usize) {
 
 /// An operation that failed before submission: send a `Nop` and deliver
 /// `output` when it completes, so errors are never reported synchronously.
+/// Boxed so the pointer handed to the kernel stays valid when the `InFlight`
+/// moves.
+fn timespec(dur: Duration) -> Box<types::Timespec> {
+    Box::new(
+        types::Timespec::new()
+            .sec(dur.as_secs())
+            .nsec(dur.subsec_nanos()),
+    )
+}
+
+/// A pure timer completes with `-ETIME` when it expires.
+fn timeout_result(res: i32) -> io::Result<()> {
+    if res == -libc::ETIME {
+        Ok(())
+    } else {
+        cvt(res).map(drop)
+    }
+}
+
 fn ready(output: Output) -> (squeue::Entry, InFlight) {
     (opcode::Nop::new().build(), InFlight::Ready(output))
 }

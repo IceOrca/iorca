@@ -1,5 +1,6 @@
 //! Timers: an interval that ticks every 500ms and stops itself after five
-//! ticks, a one-shot timer, and a deadline on a UDP receive nobody answers.
+//! ticks, a one-shot timer, a kernel multishot timeout (Linux ≥ 6.4) that
+//! fires three times, and a deadline on a UDP receive nobody answers.
 
 use std::io::{self, ErrorKind};
 use std::time::Duration;
@@ -25,6 +26,19 @@ fn main() -> io::Result<()> {
     Timer::after(&mut el, Duration::from_millis(1200), |_: &mut EventLoop| {
         println!("one-shot fired after 1.2s");
     });
+
+    let mut kernel_ticks: u32 = 0;
+    el.timeout_multishot(
+        Duration::from_millis(700),
+        3,
+        move |_: &mut EventLoop, res: io::Result<bool>| match res {
+            Ok(more) => {
+                kernel_ticks += 1;
+                println!("multishot tick {kernel_ticks} (more: {more})");
+            }
+            Err(e) => println!("multishot timeout unavailable: {e}"),
+        },
+    );
 
     let sock: UdpSocket = UdpSocket::bind("127.0.0.1:0")?;
     let recv: OpId = sock.recv_from(

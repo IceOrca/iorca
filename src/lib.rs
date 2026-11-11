@@ -40,7 +40,9 @@
 //! drift-free repeating timers you can [`cancel`](Timer::cancel).
 //! [`EventLoop::deadline`] bounds any op by time: if it hasn't completed by
 //! then, it is cancelled and its callback gets `ErrorKind::TimedOut`. The raw
-//! [`EventLoop::timeout`] op is the building block for both.
+//! [`EventLoop::timeout`] op is the building block for both. The opt-in
+//! [`EventLoop::timeout_multishot`] (Linux ≥ 6.4) is a kernel-side periodic
+//! timer: one submission, many completions.
 //!
 //! ## Example
 //!

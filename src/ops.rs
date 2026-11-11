@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use iorca_driver::{Domain, Metadata, Op, OpenOptions, Output, Protocol, SockAddr, Type};
 
-use crate::event_loop::Callback;
+use crate::event_loop::{Callback, MultiCallback};
 use crate::{EventLoop, OpId};
 
 impl EventLoop {
@@ -32,6 +32,33 @@ impl EventLoop {
         F: FnOnce(&mut EventLoop, io::Result<()>) + 'static,
     {
         self.push(Op::Timeout(dur), unit_cb(cb))
+    }
+
+    /// Kernel-side periodic timer (`IORING_TIMEOUT_MULTISHOT`): one
+    /// submission that fires `cb` every `period`. Opt-in; needs Linux ≥ 6.4.
+    ///
+    /// `cb` gets `Ok(more)` on each expiry, where `more` is false on the last
+    /// call. `count` is the number of expiries, or 0 to repeat until the op
+    /// is [`cancel`](Self::cancel)led, which ends it with a final
+    /// `Err(ECANCELED)`. `cb` is never called again after `Ok(false)` or an
+    /// error. Errors: `InvalidInput` for a zero `period`; `EINVAL` from
+    /// kernels without multishot timeouts.
+    ///
+    /// Compared with [`Timer::interval`](crate::Timer::interval), this saves a
+    /// submission per tick, but the kernel re-arms the timer relative to each
+    /// expiry, so ticks are not anchored to the start time and can drift.
+    /// [`deadline`](Self::deadline) does not apply to it.
+    pub fn timeout_multishot<F>(&mut self, period: Duration, count: u32, mut cb: F) -> OpId
+    where
+        F: FnMut(&mut EventLoop, io::Result<bool>) + 'static,
+    {
+        let handler: MultiCallback = Box::new(
+            move |el: &mut EventLoop, out: Output, more: bool| match out {
+                Output::Unit(res) => cb(el, res.map(|(): ()| -> bool { more })),
+                other => mismatch(other),
+            },
+        );
+        self.push_multi(Op::TimeoutMultishot { period, count }, handler)
     }
 
     /// Reads from `fd` at `offset` into `buf`.
